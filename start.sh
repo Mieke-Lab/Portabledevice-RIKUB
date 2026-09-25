@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
-# Start Jaga Padi: project-local PostgreSQL (loopback :5433) + FastAPI backend
-# over HTTPS on LAN :8000 (self-signed cert in certs/ — HTTPS is required so the
-# browser Geolocation API works from other devices). Access: https://<pi-ip>:8000
+# Start Jaga Padi via its systemd user units (they also start by themselves at
+# boot - see deploy/). Order: PostgreSQL (:5433) -> backend (HTTPS :8000) -> CV
+# (:5001). Blocks until the backend is healthy. Access: https://<pi-ip>:8000
+#   ./start.sh          start (no-op if already running)
+#   ./start.sh restart  restart everything (e.g. after a backend code change)
+#   ./start.sh logs     follow the logs of all services
 set -euo pipefail
 ROOT=/home/pi/rikub-project
-PG_BIN=$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)
+UNITS=(rikub-db rikub-backend rikub-cv)
 
-# Start the project-local Postgres cluster if not already running.
-"$PG_BIN/pg_ctl" -D "$ROOT/pgdata" -l "$ROOT/pgdata/server.log" \
-  -o "-p 5433 -c listen_addresses=127.0.0.1 -c unix_socket_directories=$ROOT/pgrun" \
-  -w start || true
+case "${1:-start}" in
+  start)   systemctl --user start rikub.target ;;
+  restart) systemctl --user restart "${UNITS[@]}" ;;
+  logs)    exec journalctl --user-unit rikub-db --user-unit rikub-backend \
+             --user-unit rikub-cv -f -n 50 ;;
+  *) echo "usage: $0 [start|restart|logs]"; exit 1 ;;
+esac
 
-# Run the backend (serves API + built SPA at web/dist). Ctrl-C stops the backend;
-# Postgres keeps running (use ./stop.sh to stop it too).
-cd "$ROOT/server"
-export MPLCONFIGDIR="$ROOT/.cache/matplotlib"
-exec ./venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 \
-  --ssl-keyfile "$ROOT/certs/key.pem" --ssl-certfile "$ROOT/certs/cert.pem"
+"$ROOT/deploy/wait-healthy.sh" 240
+systemctl --user --no-pager --no-legend list-units 'rikub*'
