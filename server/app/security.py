@@ -50,8 +50,11 @@ _SECURITY_HEADERS = {
 # handles ONE request at a time and takes 1.5-3+ min each. A per-IP sliding window caps
 # abuse (a buggy retry loop, a script) without hurting real use: 4 requests / 600s is
 # generous — a human waiting 1.5-3 min per reply cannot realistically exceed it, but a
-# runaway loop trips it almost immediately. Only these two POST endpoints are limited.
+# runaway loop trips it almost immediately. Only these POSTs (and /api/agent/*) are limited.
 _RATE_LIMITED_PATHS = frozenset({"/api/chat", "/api/parameter"})
+# Every agent POST (new case, follow-up, /pesan) is also a Gemma call on the Jetson and
+# shares the same per-IP budget.
+_RATE_LIMITED_PREFIX = "/api/agent/"
 _RATE_LIMIT_MAX_REQUESTS = 4
 _RATE_LIMIT_WINDOW_SECONDS = 600.0
 _RATE_LIMIT_MESSAGE = {
@@ -81,7 +84,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self._hits: dict[str, deque] = {}
 
     async def dispatch(self, request, call_next):
-        if request.method == "POST" and request.url.path in _RATE_LIMITED_PATHS:
+        path = request.url.path
+        if request.method == "POST" and (path in _RATE_LIMITED_PATHS or path.startswith(_RATE_LIMITED_PREFIX)):
             client = request.client.host if request.client else "unknown"
             now = time.monotonic()
             cutoff = now - _RATE_LIMIT_WINDOW_SECONDS

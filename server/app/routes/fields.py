@@ -9,6 +9,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field as PydanticField
+from shapely.geometry import shape
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
@@ -213,6 +214,8 @@ def spray_polygon_to_dict(polygon: SprayPolygon) -> dict:
         "selected_chambers": polygon.selected_chambers or [],
         "chamber_mode": polygon.chamber_mode or "none",
         "chamber_doses": polygon.chamber_doses or {},
+        "source": polygon.source or "auto",
+        "origin_code": polygon.origin_code,
         "detections": [detection_to_dict(item) for item in polygon.detections],
         "created_at": polygon.created_at.isoformat()
         if polygon.created_at
@@ -237,6 +240,8 @@ def spray_polygons_to_geojson(polygons: list[SprayPolygon]) -> dict:
                     "selected_chambers": polygon.selected_chambers or [],
                     "chamber_mode": polygon.chamber_mode or "none",
                     "chamber_doses": polygon.chamber_doses or {},
+                    "source": polygon.source or "auto",
+                    "origin_code": polygon.origin_code,
                     "detections": [
                         detection_to_dict(item) for item in polygon.detections
                     ],
@@ -818,6 +823,115 @@ def preview_ndvi_zones(
     return generate_ndvi_zone_preview(imagery, payload)
 
 
+def _safe_shape(geometry: Any):
+    try:
+        geom = shape(geometry)
+        return geom if geom.is_valid else geom.buffer(0)
+    except Exception:
+        return None
+
+
+def plan_zone_carryover(db: Session, imagery: FieldImagery, features: list) -> dict:
+    """How the zones about to be replaced hand their data to the new zones.
+
+    Re-approving zones deletes and recreates every SprayPolygon of this imagery, and
+    target_detections cascade on delete - so without this, every HPT linked to a zone
+    silently disappeared. Each old zone is located by a point guaranteed inside it
+    (representative_point); the new zone covering that point inherits its HPT and, if
+    unambiguous, its manual chamber settings. Fallback: the new zone overlapping the old
+    one the most. HPT with no new zone at all are kept, just unlinked (polygon_id NULL).
+    Uses the old zone's location, not the detection GPS: the operator picked the zone
+    on purpose, while the phone's fix can sit on a boundary.
+    """
+    new_shapes = [
+        _safe_shape(f.get("geometry")) if isinstance(f, dict) else None for f in features
+    ]
+
+    def locate(old_shape) -> int | None:
+        if old_shape is None or old_shape.is_empty:
+            return None
+        point = old_shape.representative_point()
+        for i, s in enumerate(new_shapes):
+            if s is not None and s.covers(point):
+                return i
+        best, best_area = None, 0.0
+        for i, s in enumerate(new_shapes):
+            if s is not None:
+                area = s.intersection(old_shape).area
+                if area > best_area:
+                    best, best_area = i, area
+        return best
+
+    # Manual (drawn) zones are not replaced by Approve Zones, so only automatic ones hand over.
+    old = db.query(SprayPolygon).filter(
+        SprayPolygon.field_imagery_id == imagery.id, SprayPolygon.source != "manual").all()
+    detections: list[dict] = []   # {id, chamber, new_index | None}
+    manual_by_new: dict[int, list[dict]] = {}
+    manual_total = 0
+    for polygon in old:
+        new_index = locate(_safe_shape(polygon.geometry))
+        for d in polygon.detections:
+            detections.append({"id": d.id, "chamber": d.chamber, "new_index": new_index})
+        if polygon.chamber_mode == "manual":
+            manual_total += 1
+            if new_index is not None:
+                manual_by_new.setdefault(new_index, []).append({
+                    "selected_chambers": polygon.selected_chambers or [],
+                    "chamber_doses": polygon.chamber_doses or {},
+                })
+
+    # Carry a manual setting only when every old manual zone landing on a new zone agrees.
+    manual_carry = {
+        i: settings[0] for i, settings in manual_by_new.items()
+        if all(s == settings[0] for s in settings)
+    }
+    moved = sum(1 for d in detections if d["new_index"] is not None)
+    manual_zones = db.query(SprayPolygon).filter(
+        SprayPolygon.field_imagery_id == imagery.id, SprayPolygon.source == "manual").count()
+    return {
+        "detections": detections,
+        "manual_carry": manual_carry,
+        "stats": {
+            "existing_zones": len(old),
+            "hpt_total": len(detections),
+            "hpt_moved": moved,
+            "hpt_unzoned": len(detections) - moved,
+            "manual_total": manual_total,
+            "manual_kept": sum(len(manual_by_new[i]) for i in manual_carry),
+            "manual_reset": manual_total - sum(len(manual_by_new[i]) for i in manual_carry),
+            # Drawn zones are kept as-is; the new automatic zones get clipped around them.
+            "manual_zones": manual_zones,
+        },
+    }
+
+
+def _zone_features(payload: ApprovedZonesSaveRequest) -> list:
+    features = payload.geojson.get("features")
+    if not isinstance(features, list):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="geojson.features must be a list",
+        )
+    return features
+
+
+@imagery_router.post("/{imagery_id}/ndvi-zones/save-impact")
+def ndvi_zones_save_impact(
+    imagery_id: UUID,
+    payload: ApprovedZonesSaveRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Dry run of /ndvi-zones/save: what happens to existing zones' HPT and manual
+    chamber settings. Changes nothing - the UI shows this before approving."""
+    imagery = db.get(FieldImagery, imagery_id)
+    if imagery is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Imagery not found: {imagery_id}",
+        )
+    return plan_zone_carryover(db, imagery, _zone_features(payload))["stats"]
+
+
 @imagery_router.post("/{imagery_id}/ndvi-zones/save", status_code=status.HTTP_201_CREATED)
 def save_ndvi_zones(
     imagery_id: UUID,
@@ -831,16 +945,19 @@ def save_ndvi_zones(
             detail=f"Imagery not found: {imagery_id}",
         )
 
-    features = payload.geojson.get("features")
-    if not isinstance(features, list):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="geojson.features must be a list",
-        )
+    features = _zone_features(payload)
+    carry = plan_zone_carryover(db, imagery, features)
 
+    # Unlink HPT first so the cascade on the zone delete below can't take them along.
+    detection_ids = [d["id"] for d in carry["detections"]]
+    if detection_ids:
+        db.query(TargetDetection).filter(TargetDetection.id.in_(detection_ids)).update(
+            {TargetDetection.polygon_id: None}, synchronize_session=False)
     db.query(SprayPolygon).filter(
         SprayPolygon.field_imagery_id == imagery.id,
+        SprayPolygon.source != "manual",
     ).delete(synchronize_session=False)
+    db.expire_all()
 
     settings = payload.settings.model_dump()
     polygons = []
@@ -872,20 +989,58 @@ def save_ndvi_zones(
             selected_chambers=[],
             chamber_mode="none",
             chamber_doses={},
+            source="auto",
+            origin_code=f"Z{index:02d}",
         )
         db.add(polygon)
         polygons.append(polygon)
+    db.flush()  # assigns the new polygon ids
+    # The approved shapes become the clipping origins (manual zones are cut out of them).
+    imagery.zone_origins = [
+        {"code": p.zone_code, "sequence_no": p.sequence_no, "geometry": p.geometry, "settings": settings,
+         "area_m2": p.area_m2, "mean_ndvi": p.mean_ndvi}
+        for p in polygons
+    ]
 
+    # Re-link HPT to their new zones, then restore chambers: a carried manual setting
+    # wins, otherwise zones with HPT go back to auto (chambers derived from the HPT).
+    moved_chambers: dict[int, list] = {}
+    for d in carry["detections"]:
+        if d["new_index"] is not None:
+            moved_chambers.setdefault(d["new_index"], []).append(d["chamber"])
+            db.query(TargetDetection).filter(TargetDetection.id == d["id"]).update(
+                {TargetDetection.polygon_id: polygons[d["new_index"]].id}, synchronize_session=False)
+    for i, polygon in enumerate(polygons):
+        manual = carry["manual_carry"].get(i)
+        if manual:
+            polygon.chamber_mode = "manual"
+            polygon.selected_chambers = manual["selected_chambers"]
+            polygon.chamber_doses = manual["chamber_doses"]
+        elif i in moved_chambers:
+            polygon.selected_chambers = normalize_chambers([c for c in moved_chambers[i] if c])
+            polygon.chamber_mode = "auto" if polygon.selected_chambers else "none"
+
+    # Manual zones win: cut the fresh automatic zones around any drawn zone.
+    from app.zones import reclip_auto_zones  # local import: app.zones imports this module
+
+    clip = reclip_auto_zones(db, imagery)
     db.commit()
-    for polygon in polygons:
-        db.refresh(polygon)
+    polygons = imagery_zones(db, imagery.id)
 
     return {
         "field_id": str(imagery.field_id),
         "field_imagery_id": str(imagery.id),
         "polygons": [spray_polygon_to_dict(polygon) for polygon in polygons],
         "geojson": spray_polygons_to_geojson(polygons),
+        "carryover": carry["stats"],
+        "clip": clip,
     }
+
+
+def imagery_zones(db: Session, imagery_id) -> list[SprayPolygon]:
+    """All spray zones of one imagery - automatic (Z..) first, then manual (ZM..)."""
+    return db.query(SprayPolygon).filter(SprayPolygon.field_imagery_id == imagery_id).order_by(
+        SprayPolygon.sequence_no, SprayPolygon.zone_code).all()
 
 
 @router.get("/{field_id}/spray-targets")
@@ -905,7 +1060,7 @@ def list_spray_targets(
     if imagery_id is not None:
         query = query.filter(SprayPolygon.field_imagery_id == imagery_id)
 
-    polygons = query.order_by(SprayPolygon.sequence_no).all()
+    polygons = query.order_by(SprayPolygon.sequence_no, SprayPolygon.zone_code).all()
     return {
         "field_id": str(field_id),
         "field_imagery_id": str(imagery_id) if imagery_id else None,

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import L from "leaflet";
+import * as turf from "@turf/turf";
 import "leaflet/dist/leaflet.css";
 import "leaflet.markercluster";
 import "leaflet.markercluster/dist/MarkerCluster.css";
@@ -38,6 +39,7 @@ import { createLocationMarker } from "@/components/maps/locationPopup";
 import { NdviHealthStats } from "@/components/maps/ndvi/NdviHealthStats";
 import { NdviZonesPanel } from "@/components/maps/ndvi/NdviZonesPanel";
 import { SprayTargetsPanel } from "@/components/maps/spray-targets/SprayTargetsPanel";
+import { ManualZoneDrawPanel } from "@/components/maps/spray-targets/ManualZoneDrawPanel";
 import { SprayingRoutePanel } from "@/components/maps/spraying-route/SprayingRoutePanel";
 import { FlightSettingsWidget } from "@/components/maps/spraying-route/FlightSettingsWidget";
 import { computeChamberGroups, defaultLaneSpacing } from "@/lib/gcs/chamber-groups";
@@ -121,6 +123,9 @@ export function Maps() {
   );
   const [ndviZonesLoading, setNdviZonesLoading] = useState(false);
   const [approveZonesLoading, setApproveZonesLoading] = useState(false);
+  // Dry-run result shown before re-approving zones that already carry HPT or manual
+  // chamber settings (see /ndvi-zones/save-impact); null = nothing pending.
+  const [approveImpact, setApproveImpact] = useState(null);
   const [ndviZonesError, setNdviZonesError] = useState("");
   const [ndviZonesSummary, setNdviZonesSummary] = useState(null);
   const [ndviZoneFeatures, setNdviZoneFeatures] = useState([]);
@@ -128,6 +133,13 @@ export function Maps() {
   const [sprayTargetsError, setSprayTargetsError] = useState("");
   const [sprayTargetFeatures, setSprayTargetFeatures] = useState([]);
   const [activeAnalysisPanel, setActiveAnalysisPanel] = useState("ndvi-zones");
+  // Manual spray zone being drawn or reshaped: {mode: "create" | "edit", polygonId?,
+  // zoneCode?, points: [{lat, lng}], preview: {report, geojson, polygonId} | null,
+  // previewing, saving, error}. null = not drawing. See app/zones.py for the rules.
+  const [manualDraw, setManualDraw] = useState(null);
+  const manualDrawRef = useRef(null);
+  const manualDraftLayer = useRef(null);
+  const manualPreviewLayer = useRef(null);
   const [routeAltitude, setRouteAltitude] = useState(5);
   const [routeLaneSpacing, setRouteLaneSpacing] = useState(() => defaultLaneSpacing(5));
   const [topRightTab, setTopRightTab] = useState("ndvi");
@@ -315,6 +327,20 @@ export function Maps() {
     selectedSprayTargetLayer.current = null;
   }
 
+  // Manual (drawn) zones in amber, automatic NDVI zones in rose.
+  function sprayTargetStyle(feature) {
+    const manual = feature?.properties?.source === "manual";
+    return {
+      color: manual ? "#d97706" : "#e11d48",
+      weight: 2.5,
+      opacity: 1,
+      fillColor: manual ? "#fbbf24" : "#fb7185",
+      fillOpacity: manual ? 0.25 : 0.18,
+      lineCap: "round",
+      lineJoin: "round",
+    };
+  }
+
   function renderSprayTargetsGeoJson(geojson) {
     if (!map.current) return;
     removeSprayTargetsLayer();
@@ -327,15 +353,7 @@ export function Maps() {
       featureCollection,
       {
         pane: "sprayTargetsPane",
-        style: {
-          color: "#e11d48",
-          weight: 2.5,
-          opacity: 1,
-          fillColor: "#fb7185",
-          fillOpacity: 0.18,
-          lineCap: "round",
-          lineJoin: "round",
-        },
+        style: sprayTargetStyle,
         onEachFeature: (feature, polygonLayer) => {
           const props = feature.properties ?? {};
           const targetKey = props.id ?? props.zone_code;
@@ -345,6 +363,10 @@ export function Maps() {
           polygonLayer.on({
             click: (event) => {
               L.DomEvent.stopPropagation(event);
+              if (manualDrawRef.current) {
+                addManualPoint(event.latlng); // drawing over an existing zone
+                return;
+              }
               selectSprayTargetLayer(polygonLayer);
               openSprayTargetPopup(polygonLayer, event.latlng);
             },
@@ -885,6 +907,17 @@ export function Maps() {
         : "Belum ada chamber dari deteksi";
     const areaM2 = props?.area_m2 != null ? `${formatNumber(props.area_m2)} m²` : "-";
     const meanNdvi = props?.mean_ndvi != null ? formatNumber(props.mean_ndvi, 4) : "-";
+    const manualActions = props?.source === "manual"
+      ? `<div style="${DIV}"></div>
+      <div style="margin-bottom:14px">
+        <div style="${LBL};margin-bottom:8px">Zona Manual</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+          <button type="button" class="jp-manual-edit" style="height:36px;border-radius:11px;border:1.5px solid #fcd34d;background:#fffbeb;color:#b45309;font-size:11px;font-weight:850;cursor:pointer">Ubah bentuk</button>
+          <button type="button" class="jp-manual-delete" style="height:36px;border-radius:11px;border:1.5px solid #fecaca;background:#fff;color:#dc2626;font-size:11px;font-weight:850;cursor:pointer">Hapus zona</button>
+        </div>
+        <div class="jp-manual-delete-info" style="display:none;margin-top:8px;font-size:11px;font-weight:700;color:#92400e;line-height:1.4"></div>
+      </div>`
+      : "";
 
     const chamberOpts = ["fungisida", "insektisida"]
       .map((opt) => {
@@ -959,6 +992,7 @@ export function Maps() {
         <div><div style="${LBL}">Area</div><div style="${VAL}">${areaM2}</div></div>
         <div><div style="${LBL}">Mean NDVI</div><div style="${VAL}">${meanNdvi}</div></div>
       </div>
+      ${manualActions}
       <div style="${DIV}"></div>
       <div style="margin-bottom:14px">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
@@ -1029,6 +1063,40 @@ export function Maps() {
     el.querySelector(".jp-spray-target-close")?.addEventListener("click", (e) => {
       e.stopPropagation();
       polygonLayer.closePopup();
+    });
+
+    // Manual zones: reshape, or delete in two taps (the first shows what comes back).
+    el.querySelector(".jp-manual-edit")?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      polygonLayer.closePopup();
+      startManualDraw(polygonLayer.feature);
+    });
+    const deleteBtn = el.querySelector(".jp-manual-delete");
+    const deleteInfo = el.querySelector(".jp-manual-delete-info");
+    let deleteArmed = false;
+    deleteBtn?.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      deleteBtn.disabled = true;
+      try {
+        const data = await deleteManualZoneRequest(props.id, !deleteArmed);
+        if (!deleteArmed) {
+          deleteInfo.textContent = manualDeleteImpactText(data.report);
+          deleteInfo.style.display = "block";
+          deleteBtn.textContent = "Yakin hapus?";
+          deleteBtn.style.background = "#dc2626";
+          deleteBtn.style.color = "#fff";
+          deleteArmed = true;
+        } else {
+          polygonLayer.closePopup();
+          renderSprayTargetsGeoJson(data.geojson);
+        }
+      } catch (err) {
+        deleteInfo.textContent = err.message || "Gagal menghapus zona";
+        deleteInfo.style.color = "#dc2626";
+        deleteInfo.style.display = "block";
+      } finally {
+        deleteBtn.disabled = false;
+      }
     });
 
     const modeLabel = el.querySelector(".jp-chamber-mode");
@@ -1310,6 +1378,7 @@ export function Maps() {
     if (!map.current) return;
     setNdviZonesLoading(true);
     setNdviZonesError("");
+    setApproveImpact(null); // a new preview invalidates any pending confirmation
     try {
       const imagery = selectedImagery ?? (await fetchLatestImagery());
       setSelectedImagery(imagery);
@@ -1354,6 +1423,10 @@ export function Maps() {
           polygonLayer.on({
             click: (event) => {
               L.DomEvent.stopPropagation(event);
+              if (manualDrawRef.current) {
+                addManualPoint(event.latlng);
+                return;
+              }
               openNdviZonePopupAtCenter(polygonLayer);
             },
             mouseover: (event) => {
@@ -1413,6 +1486,89 @@ export function Maps() {
     } finally {
       setSprayTargetsLoading(false);
     }
+  }
+
+  function addManualPoint(latlng) {
+    setManualDraw((d) =>
+      d
+        ? { ...d, points: [...d.points, { lat: latlng.lat, lng: latlng.lng }], preview: null, previewing: false, error: "" }
+        : d,
+    );
+  }
+
+  function undoManualPoint() {
+    setManualDraw((d) => d && { ...d, points: d.points.slice(0, -1), preview: null, previewing: false, error: "" });
+  }
+
+  function manualRingGeometry(points) {
+    const coords = points.map((point) => [point.lng, point.lat]);
+    return { type: "Polygon", coordinates: [[...coords, coords[0]]] };
+  }
+
+  // Start drawing a new manual zone, or reshape an existing one (feature given).
+  function startManualDraw(feature = null) {
+    if (!selectedImagery) return;
+    map.current?.closePopup();
+    clearSelectedSprayTargetLayer();
+    setActiveAnalysisPanel("spray-targets");
+    const base = { preview: null, previewing: false, saving: false, error: "" };
+    if (feature) {
+      const ring = feature.geometry?.coordinates?.[0] ?? [];
+      setManualDraw({
+        ...base,
+        mode: "edit",
+        polygonId: feature.properties?.id,
+        zoneCode: feature.properties?.zone_code,
+        points: ring.slice(0, -1).map(([lng, lat]) => ({ lat, lng })),
+      });
+    } else {
+      setManualDraw({ ...base, mode: "create", points: [] });
+    }
+  }
+
+  function manualZoneRequest(draw, dryRun) {
+    const qs = dryRun ? "?dry_run=true" : "";
+    const init = {
+      method: draw.mode === "edit" ? "PATCH" : "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ geometry: manualRingGeometry(draw.points) }),
+    };
+    return draw.mode === "edit"
+      ? fetch(`/polygons/${draw.polygonId}/geometry${qs}`, init)
+      : fetch(`/imagery/${selectedImagery.id}/manual-zones${qs}`, init);
+  }
+
+  async function saveManualZone() {
+    const draw = manualDrawRef.current;
+    if (!draw || draw.points.length < 3) return;
+    setManualDraw((d) => d && { ...d, saving: true, error: "" });
+    try {
+      const res = await manualZoneRequest(draw, false);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.detail || "Gagal menyimpan zona manual");
+      setManualDraw(null);
+      renderSprayTargetsGeoJson(data.geojson);
+      const id = data.polygon?.id ?? draw.polygonId;
+      if (id) setTimeout(() => focusSprayTarget(id), 50);
+    } catch (err) {
+      setManualDraw((d) => d && { ...d, saving: false, error: err.message });
+    }
+  }
+
+  async function deleteManualZoneRequest(polygonId, dryRun) {
+    const res = await fetch(`/polygons/${polygonId}${dryRun ? "?dry_run=true" : ""}`, { method: "DELETE" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data?.detail || "Gagal menghapus zona");
+    return data;
+  }
+
+  function manualDeleteImpactText(report) {
+    const parts = [];
+    const back = [...(report?.restored ?? []), ...(report?.clipped ?? [])].map((r) => r.origin);
+    if (back.length) parts.push(`Area dikembalikan ke ${back.join(", ")}.`);
+    if (report?.hpt_moved) parts.push(`${report.hpt_moved} HPT dipindah ke zona otomatis di bawahnya.`);
+    if (report?.hpt_unzoned) parts.push(`${report.hpt_unzoned} HPT dilepas dari zona (tetap tersimpan).`);
+    return parts.length ? parts.join(" ") : "Tidak ada zona otomatis yang terdampak.";
   }
 
   async function updateSprayTargetChambers(targetId, payload) {
@@ -1505,7 +1661,10 @@ export function Maps() {
     }
   }
 
-  async function approveNdviZones() {
+  // Approving replaces every zone of this imagery. The backend moves existing HPT and
+  // manual chamber settings onto the new zones, so first ask it what would move and,
+  // if anything would, let the user confirm before saving (confirmed=true).
+  async function approveNdviZones(confirmed = false) {
     if (!selectedImagery || ndviZoneFeatures.length === 0) return;
     setApproveZonesLoading(true);
     setNdviZonesError("");
@@ -1514,6 +1673,23 @@ export function Maps() {
         type: "FeatureCollection",
         features: ndviZoneFeatures,
       };
+      if (!confirmed) {
+        const impactRes = await fetch(
+          `/imagery/${selectedImagery.id}/ndvi-zones/save-impact`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ settings: ndviZoneSettings, geojson }),
+          },
+        );
+        const impact = await impactRes.json();
+        if (!impactRes.ok) throw new Error(impact?.detail || "Gagal cek dampak approve");
+        if (impact.hpt_total > 0 || impact.manual_total > 0) {
+          setApproveImpact(impact);
+          return; // wait for the user's confirmation in the panel
+        }
+      }
+      setApproveImpact(null);
       const res = await fetch(
         `/imagery/${selectedImagery.id}/ndvi-zones/save`,
         {
@@ -1734,10 +1910,16 @@ export function Maps() {
     m.createPane("sprayTargetsPane");
     m.getPane("sprayTargetsPane").style.zIndex = 660;
     m.getPane("sprayTargetsPane").style.pointerEvents = "auto";
+    m.createPane("manualDraftPane"); // manual-zone draft + draggable vertices, above zones
+    m.getPane("manualDraftPane").style.zIndex = 670;
     ensureBaseLayer("satellite").addTo(m);
     currentBaseLayer.current = "satellite";
     L.control.scale({ imperial: false }).addTo(m);
     m.on("click", (e) => {
+      if (manualDrawRef.current) {
+        addManualPoint(e.latlng);
+        return;
+      }
       clearSelectedSprayTargetLayer();
       dropMarker(e.latlng.lat, e.latlng.lng);
     });
@@ -1886,6 +2068,131 @@ export function Maps() {
   const topRightConflict = ndviStatsVisible && routeActive;
   const showNdviStats = ndviStatsVisible && (!topRightConflict || topRightTab === "ndvi");
   const showFlightSettings = routeActive && (!topRightConflict || topRightTab === "flight");
+
+  // --- Manual zone drawing ------------------------------------------------------
+  useEffect(() => {
+    manualDrawRef.current = manualDraw;
+  }, [manualDraw]);
+
+  // While drawing, the live spray-target layer is hidden (taps must add points, not
+  // open popups) and a non-interactive copy - or the dry-run result - is shown instead.
+  const isDrawing = manualDraw != null;
+  useEffect(() => {
+    const m = map.current;
+    if (!m) return;
+    const layer = sprayTargetsLayer.current;
+    if (isDrawing) {
+      if (layer && m.hasLayer(layer)) m.removeLayer(layer);
+      m.getContainer().style.cursor = "crosshair";
+    } else {
+      if (layer && !m.hasLayer(layer)) layer.addTo(m);
+      m.getContainer().style.cursor = "";
+    }
+  }, [isDrawing]);
+
+  // Leaving the field/imagery abandons an unsaved drawing.
+  useEffect(() => {
+    setManualDraw(null);
+  }, [selectedImagery?.id]);
+
+  // Draft polygon + draggable vertices, over the (preview of the) zones.
+  useEffect(() => {
+    const m = map.current;
+    if (!m) return;
+    if (!manualDraftLayer.current) manualDraftLayer.current = L.layerGroup().addTo(m);
+    if (!manualPreviewLayer.current) manualPreviewLayer.current = L.layerGroup().addTo(m);
+    const draft = manualDraftLayer.current;
+    const preview = manualPreviewLayer.current;
+    draft.clearLayers();
+    preview.clearLayers();
+    if (!manualDraw) return;
+
+    // The zone being drawn is shown by the draft itself, so leave it out of the preview.
+    const hideId = manualDraw.mode === "edit" ? manualDraw.polygonId : manualDraw.preview?.polygonId;
+    const base = manualDraw.preview?.geojson ?? { type: "FeatureCollection", features: sprayTargetFeatures };
+    L.geoJSON(
+      { ...base, features: (base.features ?? []).filter((f) => String(f.properties?.id) !== String(hideId)) },
+      {
+        pane: "sprayTargetsPane",
+        interactive: false,
+        style: (feature) => ({
+          ...sprayTargetStyle(feature),
+          // Dashed = current zones; solid = how they will look once this zone is saved.
+          dashArray: manualDraw.preview ? null : "5 5",
+          fillOpacity: 0.14,
+        }),
+      },
+    ).addTo(preview);
+
+    const latlngs = manualDraw.points.map((point) => [point.lat, point.lng]);
+    const color = manualDraw.error ? "#dc2626" : "#d97706";
+    if (latlngs.length >= 3) {
+      L.polygon(latlngs, {
+        pane: "manualDraftPane", interactive: false, color, weight: 3, dashArray: "6 5",
+        fillColor: "#fbbf24", fillOpacity: 0.32,
+      }).addTo(draft);
+    } else if (latlngs.length === 2) {
+      L.polyline(latlngs, { pane: "manualDraftPane", interactive: false, color, weight: 3, dashArray: "6 5" }).addTo(draft);
+    }
+    manualDraw.points.forEach((point, index) => {
+      const marker = L.marker([point.lat, point.lng], {
+        pane: "manualDraftPane",
+        draggable: true,
+        icon: L.divIcon({
+          className: "",
+          iconSize: [22, 22],
+          iconAnchor: [11, 11],
+          html: `<div style="width:22px;height:22px;border-radius:50%;box-sizing:border-box;background:${index === 0 ? color : "#fff"};border:4px solid ${color};box-shadow:0 1px 5px rgba(0,0,0,.45)"></div>`,
+        }),
+      });
+      marker.on("click", (event) => L.DomEvent.stopPropagation(event)); // tapping a vertex adds nothing
+      marker.on("dragend", (event) => {
+        const ll = event.target.getLatLng();
+        setManualDraw((d) =>
+          d && {
+            ...d,
+            points: d.points.map((q, j) => (j === index ? { lat: ll.lat, lng: ll.lng } : q)),
+            preview: null,
+            previewing: false,
+            error: "",
+          },
+        );
+      });
+      marker.addTo(draft);
+    });
+  }, [manualDraw, sprayTargetFeatures]);
+
+  // Ask the backend what saving this shape would do (dry run), shortly after the last edit.
+  const manualPointsKey = manualDraw ? JSON.stringify(manualDraw.points) : "";
+  useEffect(() => {
+    if (!manualDraw || manualDraw.points.length < 3 || !selectedImagery) return undefined;
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      setManualDraw((d) => d && { ...d, previewing: true, error: "" });
+      try {
+        const res = await manualZoneRequest(manualDraw, true);
+        const data = await res.json().catch(() => ({}));
+        if (cancelled) return;
+        if (!res.ok) throw new Error(data?.detail || "Zona tidak valid");
+        setManualDraw((d) =>
+          d && {
+            ...d,
+            previewing: false,
+            preview: { report: data.report, geojson: data.geojson, polygonId: data.polygon?.id },
+          },
+        );
+      } catch (err) {
+        if (!cancelled) setManualDraw((d) => d && { ...d, previewing: false, preview: null, error: err.message });
+      }
+    }, 600);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [manualPointsKey]);
+
+  const manualDraftAreaM2 =
+    manualDraw && manualDraw.points.length >= 3 ? turf.area(manualRingGeometry(manualDraw.points)) : 0;
 
   function renderTopRightSwitch() {
     if (!topRightConflict) return null;
@@ -2221,7 +2528,10 @@ export function Maps() {
                 onClose={() => toggleAnalysisLayer("ndvi-zones")}
                 onSettingChange={updateNdviZoneSetting}
                 onGenerate={generateNdviZones}
-                onApprove={approveNdviZones}
+                onApprove={() => approveNdviZones(false)}
+                approveImpact={approveImpact}
+                onConfirmApprove={() => approveNdviZones(true)}
+                onCancelApprove={() => setApproveImpact(null)}
                 onFocusZone={focusNdviZone}
                 onDeleteZone={deleteNdviZone}
               />
@@ -2229,7 +2539,18 @@ export function Maps() {
 
             {active.has("spray-targets") &&
               activeAnalysisPanel === "spray-targets" && (
+              manualDraw ? (
+                <ManualZoneDrawPanel
+                  draw={manualDraw}
+                  areaM2={manualDraftAreaM2}
+                  formatNumber={formatNumber}
+                  onUndo={undoManualPoint}
+                  onCancel={() => setManualDraw(null)}
+                  onSave={saveManualZone}
+                />
+              ) : (
               <SprayTargetsPanel
+                onStartManualDraw={selectedImagery ? () => startManualDraw() : null}
                 panelSwitch={renderAnalysisPanelSwitch()}
                 loading={sprayTargetsLoading}
                 error={sprayTargetsError}
@@ -2241,6 +2562,7 @@ export function Maps() {
                 chamberProducts={selectedField?.chamber_products ?? {}}
                 onChamberProductChange={updateChamberProduct}
               />
+              )
             )}
 
             {active.has("spraying-route") &&

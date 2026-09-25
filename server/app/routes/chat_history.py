@@ -1,3 +1,4 @@
+from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -15,12 +16,18 @@ class MessageCreate(BaseModel):
     sender: str  # 'user' | 'bot'
     text: str
     is_error: bool = False
+    meta: dict[str, Any] | None = None
+
+
+class SessionUpdate(BaseModel):
+    agent_case_id: str | None = None  # null/"" = no active case (next message = new diagnosis)
 
 
 def session_to_dict(session: ChatSession, include_messages: bool = False) -> dict:
     data = {
         "id": str(session.id),
         "title": session.title,
+        "agent_case_id": session.agent_case_id,
         "created_at": session.created_at,
         "updated_at": session.updated_at,
     }
@@ -35,6 +42,7 @@ def message_to_dict(message: ChatMessage) -> dict:
         "sender": message.sender,
         "text": message.text,
         "is_error": message.is_error,
+        "meta": message.meta,
         "created_at": message.created_at,
     }
 
@@ -73,6 +81,7 @@ def add_message(session_id: UUID, payload: MessageCreate, db: Session = Depends(
         sender=payload.sender,
         text=payload.text,
         is_error=payload.is_error,
+        meta=payload.meta,
     )
     db.add(message)
 
@@ -90,6 +99,17 @@ def add_message(session_id: UUID, payload: MessageCreate, db: Session = Depends(
     db.commit()
     db.refresh(message)
     return message_to_dict(message)
+
+
+@router.patch("/{session_id}")
+def update_session(session_id: UUID, payload: SessionUpdate, db: Session = Depends(get_db)) -> dict:
+    session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+    session.agent_case_id = (payload.agent_case_id or "").strip() or None
+    db.commit()
+    db.refresh(session)
+    return session_to_dict(session)
 
 
 @router.delete("/{session_id}", status_code=status.HTTP_204_NO_CONTENT)

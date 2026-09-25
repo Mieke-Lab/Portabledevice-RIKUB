@@ -20,6 +20,9 @@ def main() -> None:
         conn.execute(text("ALTER TABLE spray_polygons ADD COLUMN IF NOT EXISTS chamber_mode TEXT NOT NULL DEFAULT 'none'"))
         conn.execute(text("ALTER TABLE spray_polygons ADD COLUMN IF NOT EXISTS chamber_doses JSONB NOT NULL DEFAULT '{}'::jsonb"))
         conn.execute(text("ALTER TABLE spray_polygons DROP COLUMN IF EXISTS chamber"))
+        conn.execute(text("ALTER TABLE spray_polygons ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'auto'"))
+        conn.execute(text("ALTER TABLE spray_polygons ADD COLUMN IF NOT EXISTS origin_code TEXT"))
+        conn.execute(text("ALTER TABLE field_imagery ADD COLUMN IF NOT EXISTS zone_origins JSONB"))
         conn.execute(text("ALTER TABLE target_detections ADD COLUMN IF NOT EXISTS disease_name TEXT"))
         # Backfill disease_name from the legacy `name` column, but only if that
         # column still exists (old schema). On a fresh DB `name` is absent, so a
@@ -45,6 +48,8 @@ def main() -> None:
         conn.execute(text("ALTER TABLE target_detections ADD COLUMN IF NOT EXISTS soil_snapshot JSONB"))
         conn.execute(text("ALTER TABLE disease_detections ADD COLUMN IF NOT EXISTS gps_source TEXT"))
         conn.execute(text("ALTER TABLE disease_detections ADD COLUMN IF NOT EXISTS ai_narrative TEXT"))
+        conn.execute(text("ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS agent_case_id TEXT"))
+        conn.execute(text("ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS meta JSONB"))
     print("Database tables are ready.")
 
 

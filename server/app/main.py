@@ -14,6 +14,9 @@ from app.routes.drone import router as drone_router
 from app.routes.fields import imagery_router, polygon_router, router as fields_router
 from app.routes.health import router as health_router
 from app.routes.jobs import router as jobs_router
+from app.routes.kiosk import router as kiosk_router
+from app.routes.manual_zones import imagery_router as manual_zones_imagery_router
+from app.routes.manual_zones import polygon_router as manual_zones_polygon_router
 from app.routes.sensor import router as sensor_router, start_reader
 from app.security import add_security_middleware
 
@@ -37,6 +40,9 @@ app.include_router(chat_history_router)
 app.include_router(camera_router)
 app.include_router(sensor_router)
 app.include_router(detection_proxy_router)
+app.include_router(kiosk_router)
+app.include_router(manual_zones_imagery_router)
+app.include_router(manual_zones_polygon_router)
 app.mount(
     "/imagery",
     StaticFiles(directory=Path(__file__).resolve().parents[1] / "storage" / "imagery"),

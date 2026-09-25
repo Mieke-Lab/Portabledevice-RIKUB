@@ -1,3 +1,4 @@
+import * as turf from "@turf/turf";
 import { generateFlightPath } from "@/lib/gcs/path-planner";
 
 // Turns real lat/lng spray-target polygons into a boustrophedon (zig-zag)
@@ -33,11 +34,7 @@ export function makeLocalProjection(originLng, originLat) {
   };
 }
 
-function outerRing(geometry) {
-  if (!geometry) return null;
-  let coords = null;
-  if (geometry.type === "Polygon") coords = geometry.coordinates?.[0];
-  else if (geometry.type === "MultiPolygon") coords = geometry.coordinates?.[0]?.[0];
+function toRing(coords) {
   if (!Array.isArray(coords)) return null;
   const ring = coords
     .filter((c) => Array.isArray(c) && Number.isFinite(c[0]) && Number.isFinite(c[1]))
@@ -52,15 +49,116 @@ function outerRing(geometry) {
 }
 
 /**
+ * Every polygon part of a GeoJSON geometry with its holes: [{ring, holes: [ring]}].
+ * A spray zone can have holes (an automatic zone clipped around a manual zone drawn
+ * inside it) or several parts; reading only the first outer ring would plan - and
+ * spray - over the hole and skip the other parts.
+ */
+export function polygonParts(geometry) {
+  if (!geometry) return [];
+  const polys =
+    geometry.type === "Polygon"
+      ? [geometry.coordinates]
+      : geometry.type === "MultiPolygon"
+        ? geometry.coordinates
+        : [];
+  const parts = [];
+  for (const rings of Array.isArray(polys) ? polys : []) {
+    const ring = toRing(rings?.[0]);
+    if (!ring || ring.length < 3) continue;
+    const holes = (rings.slice(1) || []).map(toRing).filter((h) => h && h.length >= 3);
+    parts.push({ ring, holes });
+  }
+  return parts;
+}
+
+/** Parts of a target; plain {ring} areas (e.g. survey areas) count as one hole-free part. */
+function targetParts(target) {
+  if (Array.isArray(target?.parts) && target.parts.length) return target.parts;
+  return Array.isArray(target?.ring) && target.ring.length >= 3 ? [{ ring: target.ring, holes: [] }] : [];
+}
+
+const closed = (ring) => {
+  const coords = ring.map((p) => [p.lng, p.lat]);
+  return [...coords, coords[0]];
+};
+
+/**
+ * Split a polygon with holes into hole-free polygons covering exactly the same ground.
+ * The drone's spray loop only understands single rings (docs/drone_api.md: zones are
+ * `[[lat,lng],...]`), so a holed zone sent as its outer ring would spray inside the
+ * hole too - on top of the manual zone that owns it. Each hole is opened by cutting the
+ * polygon along a north-south line through the hole's middle (such a line always crosses
+ * the hole), recursing until no piece has holes left.
+ * @param {{ring: Array<{lng,lat}>, holes: Array<Array<{lng,lat}>>}} part
+ * @returns {Array<Array<{lng,lat}>>} hole-free rings
+ */
+export function holeFreeRings(part) {
+  if (!part?.holes?.length) return [part.ring];
+  const out = [];
+  const queue = [turf.polygon([closed(part.ring), ...part.holes.map(closed)])];
+  let guard = 0;
+  while (queue.length && guard++ < 500) {
+    const poly = queue.pop();
+    const [outer, ...holes] = poly.geometry.coordinates;
+    if (!holes.length) {
+      out.push(toRing(outer));
+      continue;
+    }
+    const xs = holes[0].map((c) => c[0]);
+    const cut = (Math.min(...xs) + Math.max(...xs)) / 2;
+    const [minX, minY, maxX, maxY] = turf.bbox(poly);
+    const pad = Math.max(maxX - minX, maxY - minY) || 1e-6;
+    for (const half of [
+      turf.bboxPolygon([minX - pad, minY - pad, cut, maxY + pad]),
+      turf.bboxPolygon([cut, minY - pad, maxX + pad, maxY + pad]),
+    ]) {
+      const piece = turf.intersect(turf.featureCollection([poly, half]));
+      if (!piece) continue;
+      const polys =
+        piece.geometry.type === "Polygon" ? [piece.geometry.coordinates] : piece.geometry.coordinates;
+      for (const rings of polys) {
+        const p = turf.polygon(rings);
+        if (turf.area(p) >= 0.01) queue.push(p); // drop float slivers along the cut
+      }
+    }
+  }
+  return out.filter((r) => r && r.length >= 3);
+}
+
+/**
+ * Spray zones for the drone: one entry per hole-free ring of every target part,
+ * polygon as [[lat, lng], ...]. Ids stay the zone code, suffixed "#2", "#3"... when a
+ * zone had to be split, all pieces carrying the zone's own chambers and doses.
+ */
+export function missionZonesFromTargets(targets) {
+  const zones = [];
+  for (const target of Array.isArray(targets) ? targets : []) {
+    const rings = targetParts(target).flatMap(holeFreeRings);
+    const baseId = String(target.zoneCode ?? target.id);
+    rings.forEach((ring, i) => {
+      zones.push({
+        id: i === 0 ? baseId : `${baseId}#${i + 1}`,
+        zoneCode: target.zoneCode ?? null,
+        polygon: ring.map((point) => [point.lat, point.lng]),
+        chambers: target.chambers,
+        chamberDoses: target.chamberDoses,
+      });
+    });
+  }
+  return zones;
+}
+
+/**
  * Normalise spray-target GeoJSON features into planning targets.
  * @param {Array} features GeoJSON features with polygon geometry
- * @returns {Array<{id, zoneCode, chambers: string[], chamberDoses: Object, areaM2: number, ring: Array<{lng, lat}>}>}
+ * @returns {Array<{id, zoneCode, chambers: string[], chamberDoses: Object, areaM2: number, ring: Array<{lng, lat}>, parts: Array<{ring, holes}>}>}
  */
 export function featuresToTargets(features) {
   const targets = [];
   for (const feature of Array.isArray(features) ? features : []) {
-    const ring = outerRing(feature?.geometry);
-    if (!ring || ring.length < 3) continue;
+    const parts = polygonParts(feature?.geometry);
+    if (!parts.length) continue;
     const props = feature.properties ?? {};
     targets.push({
       id: props.id ?? props.zone_code ?? targets.length,
@@ -69,7 +167,8 @@ export function featuresToTargets(features) {
       chamberDoses:
         props.chamber_doses && typeof props.chamber_doses === "object" ? props.chamber_doses : {},
       areaM2: Number(props.area_m2) || 0,
-      ring,
+      ring: parts[0].ring, // first part's outer ring - kept for callers that only need an outline
+      parts,
     });
   }
   return targets;
@@ -82,7 +181,7 @@ export function targetsBounds(targets) {
   let maxLng = -Infinity;
   let maxLat = -Infinity;
   for (const target of targets) {
-    for (const point of target.ring) {
+    for (const point of targetParts(target).flatMap((part) => part.ring)) {
       if (point.lng < minLng) minLng = point.lng;
       if (point.lng > maxLng) maxLng = point.lng;
       if (point.lat < minLat) minLat = point.lat;
@@ -160,12 +259,16 @@ export function planFlightPath({ targets, obstacles = [], laneSpacing, angleDeg,
   const proj = makeLocalProjection(origin.lng, origin.lat);
 
   try {
-    const objects = targets.map((target) => ({
-      type: "area",
-      shape: "polygon",
-      id: target.id,
-      points: target.ring.map((point) => proj.toLocal(point.lng, point.lat)),
-    }));
+    const toLocal = (ring) => ring.map((point) => proj.toLocal(point.lng, point.lat));
+    const objects = targets.flatMap((target) =>
+      targetParts(target).map((part) => ({
+        type: "area",
+        shape: "polygon",
+        id: target.id,
+        points: toLocal(part.ring),
+        holes: part.holes.map(toLocal), // subtracted from the coverage area
+      })),
+    );
 
     for (const obstacle of Array.isArray(obstacles) ? obstacles : []) {
       if (obstacle.kind === "polygon" && Array.isArray(obstacle.ring) && obstacle.ring.length >= 3) {

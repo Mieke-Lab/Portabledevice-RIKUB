@@ -29,6 +29,7 @@ import {
 } from "@/lib/gcs/drone-offset";
 import {
   featuresToTargets,
+  missionZonesFromTargets,
   defaultAngleDeg,
   planFlightPath,
   pathLengthMeters,
@@ -628,12 +629,14 @@ export function FlightPlan() {
       const geoWaypoints = geoPath.map((p) => ({ lat: p.lat, lng: p.lng }));
       // Each spray target polygon becomes a spray zone; its selected chambers
       // (drugs) map to per-pump application rates. See lib/gcs/spray-overlay.js.
-      const zones = targets.map((target) => ({
-        id: String(target.zoneCode ?? target.id),
-        zoneCode: target.zoneCode ?? null,
-        polygon: target.ring.map((point) => [point.lat, point.lng]),
-        chambers: target.chambers,
-        rates: ratesFromChambers(target.chambers, target.chamberDoses, chamberProducts),
+      // Holed / multi-part zones are split into hole-free rings first: the drone only
+      // understands single rings and would otherwise spray inside the holes.
+      const zones = missionZonesFromTargets(targets).map((zone) => ({
+        id: zone.id,
+        zoneCode: zone.zoneCode,
+        polygon: zone.polygon,
+        chambers: zone.chambers,
+        rates: ratesFromChambers(zone.chambers, zone.chamberDoses, chamberProducts),
       }));
       const sessionId = `spray-${Date.now().toString(36)}`;
       // The path/zones above are in the MAP frame (satellite imagery) — stored

@@ -6,10 +6,17 @@ const toTurf = (p) => [p.x * SCALE, p.y * SCALE];
 const fromTurf = (c) => ({ x: c[0] / SCALE, y: c[1] / SCALE });
 
 export function calculateCoverageZone(objects) {
+  const closedRing = (points) => [...points, points[0]].map(toTurf);
   const areaPolys = objects
     .filter((obj) => obj.type === "area" && obj.points.length >= 3)
     .map((obj) =>
-      turf.rewind(turf.polygon([[...obj.points, obj.points[0]].map(toTurf)])),
+      // Holes (obj.holes) stay holes: no lanes are laid over them.
+      turf.rewind(
+        turf.polygon([
+          closedRing(obj.points),
+          ...(obj.holes || []).filter((h) => h.length >= 3).map(closedRing),
+        ]),
+      ),
     );
 
   if (areaPolys.length === 0) return null;

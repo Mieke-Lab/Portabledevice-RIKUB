@@ -48,6 +48,11 @@ class FieldImagery(Base):
     bottom_left = Column(JSONB)
     bottom_right = Column(JSONB)
     ndvi_stats = Column(JSONB)
+    # Unclipped shapes of the automatic (NDVI) zones from the last Approve Zones:
+    # [{"code": "Z05", "sequence_no": 5, "geometry": {...}, "settings": {...}}, ...].
+    # Spray zone rows are derived from these minus the manual zones (app/zones.py), so an
+    # automatic zone that a manual zone fully covers can still come back later.
+    zone_origins = Column(JSONB)
 
     created_at = Column(DateTime, server_default=func.now())
 
@@ -80,6 +85,13 @@ class SprayPolygon(Base):
     # Per-chamber application rate (dose) in L/ha, e.g. {"fungisida": 40, "insektisida": 60}.
     # Set by the user in manual mode; empty means "use the default rate" downstream.
     chamber_doses = Column(JSONB, nullable=False, default=dict)
+    # 'auto' = NDVI zone (Approve Zones), 'manual' = drawn by the user on the map.
+    # Manual zones win: auto zones are clipped wherever a manual zone covers them.
+    source = Column(Text, nullable=False, default="auto")
+    # Auto zones only: the NDVI zone this row came from ("Z05"), a key into
+    # FieldImagery.zone_origins. One origin can yield several rows ("Z05a", "Z05b")
+    # when a manual zone splits it.
+    origin_code = Column(Text)
     created_at = Column(DateTime, server_default=func.now())
 
     detections = relationship(
@@ -149,6 +161,10 @@ class ChatSession(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     title = Column(Text, nullable=False, default="Percakapan baru")
+    # The Jetson agent case this conversation is currently about (vault note id, e.g.
+    # "20260923-194301-ec78dd"): follow-up questions are sent against it. None = the
+    # next message starts a new diagnosis.
+    agent_case_id = Column(Text)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
@@ -173,6 +189,9 @@ class ChatMessage(Base):
     sender = Column(Text, nullable=False)  # 'user' | 'bot'
     text = Column(Text, nullable=False)
     is_error = Column(Boolean, nullable=False, default=False)
+    # Structured payload for rich rendering, e.g. {"kind": "diagnosis", "hama": ...} or
+    # {"kind": "followup", "pengetahuan": [...]}. `text` stays the plain-text fallback.
+    meta = Column(JSONB)
     created_at = Column(DateTime, server_default=func.now())
 
     session = relationship("ChatSession", back_populates="messages")

@@ -1,20 +1,23 @@
 import { useEffect, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import {
   ArrowLeft, PanelLeft, Plus, Trash2, Send, SlidersHorizontal,
-  User, Leaf, Bug, Droplets, ThermometerSun, X, Loader2, Square,
+  User, Leaf, Bug, Droplets, Wheat, X, Loader2, Square,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
-  sendChatMessage, analyzeParameters,
-  listChatSessions, createChatSession, addChatMessage, deleteChatSession,
+  agentMessage, agentNewCase, agentDiagnosisMeta, agentFollowupMeta, summarizeDiagnosis,
+  listChatSessions, createChatSession, addChatMessage, deleteChatSession, updateChatSession,
 } from '@/api';
+import { CaseBanner, DiagnosisCard, FollowupBubble } from '@/components/chatbot/AgentMessages';
 
+// The first message of a case is diagnosed from its symptoms, so the starters describe
+// what the farmer sees (a general question here would be classified as a symptom).
 const SUGGESTIONS = [
-  { Icon: Leaf, text: 'Kenapa daun padi menguning?' },
-  { Icon: Bug, text: 'Cara atasi hama wereng?' },
-  { Icon: Droplets, text: 'Jadwal pemupukan yang tepat?' },
-  { Icon: ThermometerSun, text: 'pH tanah ideal untuk padi?' },
+  { Icon: Leaf, text: 'Daun menguning dari ujung dan mengering seperti tersiram air panas' },
+  { Icon: Bug, text: 'Banyak wereng coklat di pangkal batang, tanaman menguning lalu kering' },
+  { Icon: Droplets, text: 'Bercak belah ketupat abu-abu bertepi coklat di daun' },
+  { Icon: Wheat, text: 'Malai hampa dan berwarna putih, batang berlubang' },
 ];
 // Gemma runs swap-backed on an 8GB Jetson: a single answer routinely takes
 // 1.5-3 min, so past this point we reassure the user the wait is expected.
@@ -24,10 +27,12 @@ function fromServer(session) {
   return {
     id: session.id,
     title: session.title,
+    caseId: session.agent_case_id || null,
     messages: (session.messages || []).map((m) => ({
       sender: m.sender,
       text: m.text,
       error: m.is_error,
+      meta: m.meta || null,
     })),
   };
 }
@@ -83,6 +88,10 @@ function PendingBubble({ elapsed, onCancel }) {
 
 export function Chatbot() {
   const navigate = useNavigate();
+  // /chatbot?session=<id> opens that conversation, e.g. the Detection page's
+  // "Lanjutkan tanya di Chatbot" hand-off of an AI deepening.
+  const [searchParams] = useSearchParams();
+  const wantedSession = searchParams.get('session');
   const [sessions, setSessions] = useState([]);
   const [activeId, setActiveId] = useState(null);
   const [loadingSessions, setLoadingSessions] = useState(true);
@@ -101,6 +110,19 @@ export function Chatbot() {
   const messages = active?.messages ?? [];
   const empty = messages.length === 0;
 
+  // The case this conversation is about: its diagnosis card and how many follow-ups it had.
+  const caseId = active?.caseId || null;
+  let lastDiagnosisIdx = -1;
+  messages.forEach((m, i) => {
+    if (m.meta?.kind === 'diagnosis' && m.meta.case_id === caseId) lastDiagnosisIdx = i;
+  });
+  const activeDiagnosis = caseId
+    ? (lastDiagnosisIdx >= 0 ? messages[lastDiagnosisIdx].meta : { hama: caseId })
+    : null;
+  const followupCount = caseId
+    ? messages.filter((m) => m.meta?.kind === 'followup' && m.meta.case_id === caseId).length
+    : 0;
+
   // Sessions persist server-side (Postgres) rather than browser localStorage:
   // WebKitGTK inside the pywebview kiosk does not reliably keep localStorage
   // across process restarts, so history vanished every time the window closed.
@@ -110,9 +132,9 @@ export function Chatbot() {
         let list = await listChatSessions();
         if (list.length === 0) list = [await createChatSession()];
         setSessions(list.map(fromServer));
-        setActiveId(list[0].id);
+        setActiveId(wantedSession && list.some((s) => s.id === wantedSession) ? wantedSession : list[0].id);
       } catch {
-        const fallback = { id: `local-${Date.now()}`, title: 'Percakapan baru', messages: [] };
+        const fallback = { id: `local-${Date.now()}`, title: 'Percakapan baru', caseId: null, messages: [] };
         setSessions([fallback]);
         setActiveId(fallback.id);
       } finally {
@@ -145,6 +167,14 @@ export function Chatbot() {
     }));
   }
 
+  // Remember which agent case a conversation is on (server-side, so it survives a reload).
+  function setCaseFor(sessionId, newCaseId) {
+    setSessions((prev) => prev.map((s) => (s.id === sessionId ? { ...s, caseId: newCaseId } : s)));
+    if (!String(sessionId).startsWith('local-')) {
+      updateChatSession(sessionId, { agentCaseId: newCaseId }).catch(() => {});
+    }
+  }
+
   async function newChat() {
     const created = await createChatSession();
     setSessions((p) => [fromServer(created), ...p]);
@@ -167,26 +197,29 @@ export function Chatbot() {
 
   function cancel() { abortRef.current?.abort(); }
 
-  async function send(text) {
-    if (sending) return;
-    const msg = (text ?? input).trim();
-    if (!msg) return;
-    const sid = activeId;
+  // Shared plumbing for every agent call: optimistic user bubble + pending bubble, persist the
+  // question first (it survives a kiosk restart during the 1.5-3 min wait), then render the reply.
+  async function runAgent(sid, userText, call) {
     const ac = new AbortController();
     abortRef.current = ac;
     pendingSessionIdRef.current = sid;
     setSending(true);
-    setMsgsFor(sid, (m) => [...m, { sender: 'user', text: msg }, { sender: 'bot', pending: true }]);
-    setInput('');
-    if (taRef.current) taRef.current.style.height = 'auto';
-    // Persist the question before the (1.5-3 min) Gemma call, so it survives
-    // even if the kiosk window is closed/restarted while still waiting.
-    addChatMessage(sid, { sender: 'user', text: msg }).catch(() => {});
+    setMsgsFor(sid, (m) => [...m, { sender: 'user', text: userText }, { sender: 'bot', pending: true }]);
+    addChatMessage(sid, { sender: 'user', text: userText }).catch(() => {});
     try {
-      const r = await sendChatMessage(msg, { signal: ac.signal });
-      const reply = r.response || r.message || JSON.stringify(r);
-      setMsgsFor(sid, (m) => [...m.filter((x) => !x.pending), { sender: 'bot', text: reply }]);
-      addChatMessage(sid, { sender: 'bot', text: reply }).catch(() => {});
+      const r = await call(ac.signal);
+      let reply;
+      if (!r?.ok) {
+        reply = { sender: 'bot', text: `⚠️ ${r?.message || 'Diagnosis gagal. Coba jelaskan gejalanya dengan lebih rinci.'}`, error: true };
+      } else if (r.intent === 'tanya') {
+        reply = { sender: 'bot', text: r.jawaban || '-', meta: agentFollowupMeta(r) };
+      } else {
+        const meta = agentDiagnosisMeta(r);
+        reply = { sender: 'bot', text: `Diagnosis: ${meta.hama || '-'}\n\n${summarizeDiagnosis(r.diagnosis)}`, meta };
+        setCaseFor(sid, r.case_id);
+      }
+      setMsgsFor(sid, (m) => [...m.filter((x) => !x.pending), reply]);
+      addChatMessage(sid, { sender: 'bot', text: reply.text, isError: !!reply.error, meta: reply.meta || null }).catch(() => {});
     } catch (err) {
       const isCancel = err.name === 'AbortError';
       const body = isCancel ? 'Dibatalkan oleh pengguna.' : await describeError(err);
@@ -199,36 +232,33 @@ export function Chatbot() {
     }
   }
 
-  async function runParam() {
+  // One chat box: the agent treats a question as a follow-up on the active case and
+  // anything else (symptoms) as a new diagnosis.
+  function send(text) {
+    if (sending) return;
+    const msg = (text ?? input).trim();
+    if (!msg) return;
+    setInput('');
+    if (taRef.current) taRef.current.style.height = 'auto';
+    const sid = activeId;
+    runAgent(sid, msg, (signal) => agentMessage({ teks: msg, caseId }, { signal }));
+  }
+
+  function runParam() {
     if (sending) return;
     const sid = activeId;
     const summary = `📊 Analisis parameter — suhu ${param.suhu}°C, kelembapan ${param.kelembapan}%, pH ${param.ph}${param.gejala ? `, gejala: ${param.gejala}` : ''}`;
-    const ac = new AbortController();
-    abortRef.current = ac;
-    pendingSessionIdRef.current = sid;
-    setSending(true);
     setShowParam(false);
-    setMsgsFor(sid, (m) => [...m, { sender: 'user', text: summary }, { sender: 'bot', pending: true }]);
-    addChatMessage(sid, { sender: 'user', text: summary }).catch(() => {});
-    try {
-      const r = await analyzeParameters({
-        gejala: param.gejala.trim() || 'Tidak ada gejala khusus',
-        suhu: parseFloat(param.suhu), kelembapan: parseInt(param.kelembapan, 10), ph: parseFloat(param.ph),
-      }, { signal: ac.signal });
-      const recs = Array.isArray(r.recommendations) ? r.recommendations : [];
-      const text = `🔍 Analisis:\n${r.analysis || 'Tidak ada analisis'}\n\n💡 Rekomendasi:\n${recs.length ? recs.map((x) => `• ${x}`).join('\n') : '• Tidak ada rekomendasi khusus'}`;
-      setMsgsFor(sid, (m) => [...m.filter((x) => !x.pending), { sender: 'bot', text }]);
-      addChatMessage(sid, { sender: 'bot', text }).catch(() => {});
-    } catch (err) {
-      const isCancel = err.name === 'AbortError';
-      const body = isCancel ? 'Dibatalkan oleh pengguna.' : await describeError(err);
-      setMsgsFor(sid, (m) => [...m.filter((x) => !x.pending), { sender: 'bot', text: body, error: !isCancel }]);
-      if (!isCancel) addChatMessage(sid, { sender: 'bot', text: body, isError: true }).catch(() => {});
-    } finally {
-      setSending(false);
-      abortRef.current = null;
-      pendingSessionIdRef.current = null;
-    }
+    runAgent(sid, summary, (signal) => agentNewCase({
+      gejala: param.gejala.trim() || 'Tidak ada gejala khusus',
+      suhu: param.suhu, kelembapan: param.kelembapan, ph: param.ph,
+    }, { signal }));
+  }
+
+  function newCase() {
+    if (sending) return;
+    setCaseFor(activeId, null);
+    taRef.current?.focus();
   }
 
   function onKey(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!sending) send(); } }
@@ -283,8 +313,10 @@ export function Chatbot() {
             {empty ? (
               <div className="flex h-full flex-col items-center justify-center text-center">
                 <span className="mb-4 grid h-16 w-16 place-items-center rounded-2xl bg-leaf/15 text-3xl">🌾</span>
-                <h2 className="text-2xl font-bold text-forest">Ada yang bisa saya bantu?</h2>
-                <p className="mt-1 text-sm text-muted-foreground">Asisten AI untuk pertanian padi — tanya atau analisis parameter.</p>
+                <h2 className="text-2xl font-bold text-forest">Ceritakan gejala di sawah Anda</h2>
+                <p className="mt-1 max-w-md text-sm text-muted-foreground">
+                  Asisten hama &amp; penyakit padi — mendiagnosis dari gejala, lalu menjawab pertanyaan lanjutan tentang kasus yang sama.
+                </p>
                 <div className="mt-7 grid w-full max-w-xl grid-cols-1 gap-3 sm:grid-cols-2">
                   {SUGGESTIONS.map((s, i) => (
                     <button key={i} onClick={() => send(s.text)} disabled={sending}
@@ -301,6 +333,15 @@ export function Chatbot() {
                     <Avatar who={m.sender} />
                     {m.pending ? (
                       <PendingBubble elapsed={elapsed} onCancel={cancel} />
+                    ) : m.sender === 'bot' && m.meta?.kind === 'diagnosis' ? (
+                      <DiagnosisCard
+                        meta={m.meta}
+                        onAsk={(q) => send(q)}
+                        showSuggestions={i === lastDiagnosisIdx}
+                        disabled={sending}
+                      />
+                    ) : m.sender === 'bot' && m.meta?.kind === 'followup' ? (
+                      <FollowupBubble text={m.text} meta={m.meta} />
                     ) : (
                       <div className={`max-w-[80%] whitespace-pre-wrap rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${m.sender === 'user' ? 'bg-leaf text-white' : m.error ? 'border border-destructive/40 bg-destructive/5 text-foreground' : 'border border-border bg-card text-foreground'}`}>{m.text}</div>
                     )}
@@ -331,11 +372,22 @@ export function Chatbot() {
             </div>
           )}
 
+          {/* Active case */}
+          {!empty && (
+            <div className="mt-3">
+              <CaseBanner diagnosis={activeDiagnosis} followups={followupCount} onNewCase={newCase} disabled={sending} />
+            </div>
+          )}
+
           {/* Composer */}
-          <div className="mt-3 flex items-end gap-2 rounded-2xl border border-input bg-card p-2 shadow-[0_0_0.5px_rgba(0,0,0,0.14),0_1px_1px_rgba(0,0,0,0.24)] focus-within:ring-2 focus-within:ring-ring">
+          <div className={`${empty ? 'mt-3' : ''} flex items-end gap-2 rounded-2xl border border-input bg-card p-2 shadow-[0_0_0.5px_rgba(0,0,0,0.14),0_1px_1px_rgba(0,0,0,0.24)] focus-within:ring-2 focus-within:ring-ring`}>
             <Button variant="ghost" size="icon" className="shrink-0 rounded-full text-leaf" onClick={() => setShowParam((v) => !v)} aria-label="Analisis parameter" title="Analisis parameter"><SlidersHorizontal className="h-4 w-4" /></Button>
             <textarea ref={taRef} rows={1} value={input} onChange={grow} onKeyDown={onKey}
-              placeholder={sending ? 'Menunggu jawaban sebelumnya…' : 'Tanya tentang penyakit, perawatan, atau kondisi sawah…'}
+              placeholder={sending
+                ? 'Menunggu jawaban sebelumnya…'
+                : caseId
+                  ? 'Tanya lanjutan tentang kasus ini (akhiri dengan ?), atau tulis gejala baru…'
+                  : 'Tulis gejala yang terlihat di sawah…'}
               className="max-h-[140px] flex-1 resize-none bg-transparent px-1 py-2 text-sm outline-none" />
             {sending ? (
               <Button size="icon" variant="outline" className="shrink-0 rounded-full border-destructive/40 text-destructive hover:bg-destructive/10" onClick={cancel} aria-label="Batalkan" title="Batalkan permintaan"><Square className="h-4 w-4" /></Button>
@@ -346,7 +398,7 @@ export function Chatbot() {
           <p className="mt-1.5 text-center text-[11px] text-muted-foreground/70">
             {sending
               ? 'Menunggu jawaban sebelumnya… hanya satu permintaan diproses dalam satu waktu.'
-              : 'Enter kirim · Shift+Enter baris baru · ⚙ Analisis parameter'}
+              : 'Enter kirim · Shift+Enter baris baru · ⚙ Analisis parameter · jawaban & kasus tersimpan di catatan Obsidian'}
           </p>
         </div>
       </div>

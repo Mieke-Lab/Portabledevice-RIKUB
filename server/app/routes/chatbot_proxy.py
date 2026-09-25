@@ -2,6 +2,7 @@ import asyncio
 import itertools
 import logging
 import os
+import re
 import sys
 import time
 
@@ -16,6 +17,10 @@ CHATBOT_UPSTREAM_URL = os.getenv("CHATBOT_UPSTREAM_URL", "http://100.116.176.70:
 CHATBOT_PROXY_TIMEOUT = 300.0
 # Health probe hits /docs (a static Swagger page), so keep it short and snappy.
 CHATBOT_HEALTH_TIMEOUT = 5.0
+# Agent reads (case list/detail) never touch Gemma.
+CHATBOT_READ_TIMEOUT = 15.0
+# Agent case ids are the Jetson vault note names, e.g. 20260923-194301-ec78dd.
+_CASE_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
 
 # Self-contained logger: uvicorn's default config leaves the root logger without a
 # handler, so INFO lines from a propagating logger would be dropped. Attach our own
@@ -113,6 +118,26 @@ async def _proxy_post(path: str, body: dict) -> JSONResponse:
                 )
 
 
+async def _proxy_get(path: str, params: dict | None = None) -> JSONResponse:
+    """Read-only agent calls (case list/detail, health): no Gemma involved, so they skip
+    the upstream lock and use a short timeout - they stay fast while an answer is running."""
+    try:
+        async with httpx.AsyncClient(timeout=CHATBOT_READ_TIMEOUT) as client:
+            upstream = await client.get(f"{CHATBOT_UPSTREAM_URL}{path}", params=params)
+        return JSONResponse(status_code=upstream.status_code, content=upstream.json())
+    except httpx.TimeoutException:
+        return JSONResponse(status_code=504, content={"ok": False, "message": "Chatbot service tidak merespon (timeout)."})
+    except httpx.ConnectError:
+        return JSONResponse(status_code=502, content={"ok": False, "message": "Chatbot service tidak dapat dihubungi."})
+    except Exception:  # noqa: BLE001
+        logger.exception("agent GET failed path=%s", path)
+        return JSONResponse(status_code=502, content={"ok": False, "message": "Chatbot service mengalami kesalahan tak terduga."})
+
+
+def _case_id_ok(case_id: str) -> bool:
+    return bool(_CASE_ID_RE.match(case_id or ""))
+
+
 @router.post("/api/chat")
 async def proxy_chat(request: Request) -> JSONResponse:
     return await _proxy_post("/api/chat", await request.json())
@@ -121,6 +146,47 @@ async def proxy_chat(request: Request) -> JSONResponse:
 @router.post("/api/parameter")
 async def proxy_parameter(request: Request) -> JSONResponse:
     return await _proxy_post("/api/parameter", await request.json())
+
+
+# --- Interactive agent (Jetson agent_api.py: diagnosis + follow-up + Obsidian memory) ---
+# Every POST runs Gemma on the Jetson, so it goes through the same one-at-a-time lock
+# and rate limit as /api/chat.
+
+
+@router.post("/api/agent/pesan")
+async def proxy_agent_message(request: Request) -> JSONResponse:
+    """One chat box: a question about the active case -> follow-up, else new diagnosis."""
+    return await _proxy_post("/api/agent/pesan", await request.json())
+
+
+@router.post("/api/agent/kasus")
+async def proxy_agent_new_case(request: Request) -> JSONResponse:
+    """New case from symptoms (+ optional suhu/kelembapan/pH = parameter mode)."""
+    return await _proxy_post("/api/agent/kasus", await request.json())
+
+
+@router.post("/api/agent/kasus/{case_id}/tanya")
+async def proxy_agent_ask(case_id: str, request: Request) -> JSONResponse:
+    if not _case_id_ok(case_id):
+        return JSONResponse(status_code=400, content={"ok": False, "message": "case_id tidak valid"})
+    return await _proxy_post(f"/api/agent/kasus/{case_id}/tanya", await request.json())
+
+
+@router.get("/api/agent/kasus")
+async def proxy_agent_cases(limit: int = 20) -> JSONResponse:
+    return await _proxy_get("/api/agent/kasus", {"limit": max(1, min(limit, 200))})
+
+
+@router.get("/api/agent/kasus/{case_id}")
+async def proxy_agent_case(case_id: str) -> JSONResponse:
+    if not _case_id_ok(case_id):
+        return JSONResponse(status_code=400, content={"ok": False, "message": "case_id tidak valid"})
+    return await _proxy_get(f"/api/agent/kasus/{case_id}")
+
+
+@router.get("/api/agent/health")
+async def proxy_agent_health() -> JSONResponse:
+    return await _proxy_get("/api/agent/health")
 
 
 @router.get("/api/chat/health")

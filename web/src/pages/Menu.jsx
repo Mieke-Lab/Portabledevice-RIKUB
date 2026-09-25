@@ -5,38 +5,65 @@ import { Card } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 
-// Only meaningful inside the pywebview kiosk (webview_launcher.py exposes
-// this bridge for the Esc-to-exit shortcut) - hidden entirely when the app
-// is opened in a regular browser over LAN/Tailscale, where there is no
-// window to close and no navigator.geolocation-style kiosk API to call.
-// pywebview injects window.pywebview.api asynchronously, well after React's
-// first render; its 'pywebviewready' event is prone to firing before this
-// component's listener is attached (lost event), so poll briefly instead -
-// simpler and race-free.
-function ExitKioskButton() {
-  const [ready, setReady] = useState(() => !!window.pywebview?.api?.exit_app);
+// "Keluar" closes the on-device kiosk window, whichever one the app icon opened
+// (deploy/jaga-padi-launch.sh): the pywebview shell exposes exit_app() over its JS
+// bridge; Chromium --kiosk can't close itself from JS, so there the backend
+// terminates it (POST /api/kiosk/exit, loopback-only). Shown only on the device's
+// own screen - a browser over LAN/Tailscale just closes its own tab.
+const ON_DEVICE = ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(window.location.hostname);
+const CONFIRM_MS = 3000; // second tap must follow within this window
 
+function ExitKioskButton() {
+  const [bridge, setBridge] = useState(() => !!window.pywebview?.api?.exit_app);
+  const [armed, setArmed] = useState(false);
+  const [error, setError] = useState(null);
+
+  // pywebview injects window.pywebview.api asynchronously, well after React's first
+  // render, and its 'pywebviewready' event can fire before a listener is attached -
+  // so poll briefly instead.
   useEffect(() => {
-    if (ready) return;
+    if (bridge || !ON_DEVICE) return;
     const id = setInterval(() => {
       if (window.pywebview?.api?.exit_app) {
-        setReady(true);
+        setBridge(true);
         clearInterval(id);
       }
     }, 200);
     return () => clearInterval(id);
-  }, [ready]);
+  }, [bridge]);
 
-  if (!ready) return null;
+  useEffect(() => {
+    if (!armed) return;
+    const id = setTimeout(() => setArmed(false), CONFIRM_MS);
+    return () => clearTimeout(id);
+  }, [armed]);
+
+  if (!ON_DEVICE && !bridge) return null;
+
+  async function onClick() {
+    if (!armed) { setArmed(true); setError(null); return; } // first tap only arms it
+    if (bridge) { window.pywebview.api.exit_app(); return; }
+    try {
+      const res = await fetch('/api/kiosk/exit', { method: 'POST' });
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `HTTP ${res.status}`);
+    } catch (e) {
+      setArmed(false);
+      setError(e.message);
+    }
+  }
+
   return (
-    <Button
-      variant="outline"
-      size="sm"
-      onClick={() => window.pywebview.api.exit_app()}
-      className="text-muted-foreground hover:text-destructive"
-    >
-      <LogOut className="h-4 w-4" /> Keluar
-    </Button>
+    <div className="flex items-center gap-2">
+      {error && <span className="text-xs text-destructive">{error}</span>}
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={onClick}
+        className={armed ? 'border-destructive bg-destructive text-white hover:bg-destructive/90' : 'text-muted-foreground hover:text-destructive'}
+      >
+        <LogOut className="h-4 w-4" /> {armed ? 'Tekan lagi untuk keluar' : 'Keluar'}
+      </Button>
+    </div>
   );
 }
 
@@ -201,7 +228,6 @@ export function Menu() {
             <p className="mt-1 text-xs font-semibold uppercase tracking-[1.5px] text-muted-foreground">Smart Rice Field Monitoring</p>
           </div>
         </div>
-        <ExitKioskButton />
       </header>
 
       <main className="grid min-h-0 flex-1 grid-cols-1 gap-4 overflow-y-auto md:grid-cols-[1.5fr_1fr] md:grid-rows-1 md:overflow-visible">
@@ -212,8 +238,11 @@ export function Menu() {
       </main>
 
       {/* House-green footer band (espresso-dark bookend) */}
-      <footer className="flex shrink-0 items-center justify-center gap-2 py-1 text-[11px] font-medium text-muted-foreground/70">
-        <span>v1.0.0</span><span className="opacity-50">•</span><span>RIKUB Kemdintisaintek 2025</span>
+      <footer className="flex shrink-0 flex-wrap items-center justify-between gap-2 py-1 text-[11px] font-medium text-muted-foreground/70">
+        <span className="flex items-center gap-2">
+          <span>v1.0.0</span><span className="opacity-50">•</span><span>RIKUB Kemdintisaintek 2025</span>
+        </span>
+        <ExitKioskButton />
       </footer>
     </div>
   );

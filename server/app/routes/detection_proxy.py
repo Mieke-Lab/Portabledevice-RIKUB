@@ -300,6 +300,10 @@ def list_detections(limit: int = 50, db: Session = Depends(get_db)) -> dict:
 class _NarrativeIn(BaseModel):
     prompt: str
     narrative: str
+    # When the deepening came from the Jetson agent: its case id (the chat session continues
+    # that case - follow-up questions in /chatbot) and the diagnosis-card payload.
+    meta: dict | None = None
+    agent_case_id: str | None = None
 
 
 @router.post("/api/detections/{det_id}/narrative")
@@ -315,10 +319,11 @@ def save_narrative(det_id: str, body: _NarrativeIn, db: Session = Depends(get_db
 
     det.ai_narrative = body.narrative
     disease = (det.top_disease or "Deteksi").replace("-", " ")
-    session = ChatSession(title=f"Pendalaman deteksi: {disease}")
+    session = ChatSession(title=f"Pendalaman deteksi: {disease}",
+                          agent_case_id=(body.agent_case_id or "").strip() or None)
     db.add(session)
     db.flush()
     db.add(ChatMessage(session_id=session.id, sender="user", text=body.prompt))
-    db.add(ChatMessage(session_id=session.id, sender="bot", text=body.narrative))
+    db.add(ChatMessage(session_id=session.id, sender="bot", text=body.narrative, meta=body.meta))
     db.commit()
     return {"ok": True, "session_id": str(session.id)}

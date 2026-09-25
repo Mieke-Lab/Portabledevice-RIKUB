@@ -3,12 +3,18 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import {
   ArrowLeft, ScanSearch, Upload, Camera, Sprout, Leaf,
   FlaskConical, Droplets, Thermometer, Zap, CheckCircle2, AlertTriangle,
-  MapPin, MapPinOff, Wifi, WifiOff, Loader2, Sparkles, Maximize2, Minimize2,
-  Target, MapPinned,
+  MapPin, MapPinOff, Wifi, WifiOff, Loader2, Sparkles, Maximize2, Minimize2, RotateCcw,
+  Target, MapPinned, MessageCircle,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
-import { detectDisease, sendChatMessage, saveDetectionNarrative } from '@/api';
+import {
+  detectDisease, saveDetectionNarrative, resetCameraDefaults,
+  agentNewCase, agentDiagnosisMeta, summarizeDiagnosis,
+  createChatSession, addChatMessage, updateChatSession,
+} from '@/api';
+import { CameraTuningPanel } from '@/components/detection/CameraTuningPanel';
+import { CameraIndicators } from '@/components/detection/CameraIndicators';
 
 // The CV model returns only class names + probabilities. Descriptions and
 // treatment come from this static map (offline, instant) — keyed by the model's
@@ -76,6 +82,79 @@ const DISEASE_SYMPTOMS = {
 // disease is not covered by the LLM knowledge base (so the deepen button stays hidden).
 function buildSymptomQuery(result) {
   return result?.top ? (DISEASE_SYMPTOMS[result.top.name] || null) : null;
+}
+
+// --- Presentation helpers for the diagnosis card ----------------------------------
+
+// The model's probability is calibrated but a bare "100%" reads as certainty; say it in words.
+function confidenceLabel(p) {
+  if (p >= 0.9) return 'sangat tinggi';
+  if (p >= 0.75) return 'tinggi';
+  if (p >= 0.5) return 'sedang';
+  return 'rendah';
+}
+
+// Lesion share of the leaf, from the detector's masks (cv_service lesion_percent). A rough,
+// indicative scale - measured on everything plant-coloured in the photo.
+const SEVERITY_LEVELS = [
+  { max: 5, label: 'ringan', tone: 'bg-leaf/12 text-forest' },
+  { max: 25, label: 'sedang', tone: 'bg-harvest/15 text-harvest' },
+  { max: Infinity, label: 'berat', tone: 'bg-destructive/10 text-destructive' },
+];
+function severityOf(pct) {
+  return pct == null ? null : SEVERITY_LEVELS.find((l) => pct < l.max);
+}
+
+// The LLM dataset writes advice as one unpunctuated run of imperatives ("Gunakan benih sehat
+// pupuk seimbang sanitasi jerami rotasi tanaman"). Split it into items before each action
+// word, except right after another action word ("hindari tanam tumpang tindih") or when the
+// word would stand alone at the end ("atur jarak tanam"). Text that already has separators
+// is split on those instead.
+const ADVICE_STARTERS = new Set([
+  'gunakan', 'tanam', 'rotasi', 'hindari', 'drainase', 'sanitasi', 'pupuk', 'benamkan',
+  'olah', 'bersihkan', 'perbaiki', 'kendalikan', 'atur', 'jaga', 'kurangi', 'cabut',
+  'musnahkan', 'pasang', 'lakukan', 'pantau',
+]);
+function splitAdvice(text) {
+  const t = String(text || '').trim();
+  if (!t) return [];
+  const cap = (x) => x.charAt(0).toUpperCase() + x.slice(1);
+  if (/[;\n]|\.\s|,\s/.test(t)) {
+    return t.split(/;|\n|\.\s+|,\s+/).map((x) => x.trim().replace(/\.$/, '')).filter(Boolean).map(cap);
+  }
+  const words = t.split(/\s+/);
+  const items = [];
+  let cur = [];
+  words.forEach((w, i) => {
+    const lw = w.toLowerCase();
+    const prev = (words[i - 1] || '').toLowerCase();
+    const isStarter =
+      (ADVICE_STARTERS.has(lw) || (lw === 'air' && /^\d/.test(words[i + 1] || ''))) &&
+      i > 0 && i < words.length - 1 && !ADVICE_STARTERS.has(prev);
+    if (isStarter && cur.length) { items.push(cur.join(' ')); cur = []; }
+    cur.push(w);
+  });
+  if (cur.length) items.push(cur.join(' '));
+  return items.map(cap);
+}
+
+// narasi_gemma comes as labelled lines ("Prediksi: …", "Alasan berbasis evidence RAG: …",
+// "Pencegahan: …", "Catatan: …"). Keep only the reasoning: the prediction repeats the card
+// title, prevention/control are rendered from the structured fields, and the "Catatan" line
+// is a fixed disclaimer. Unlabelled free text (a plain Gemma answer) is kept whole.
+function narasiReason(narasi) {
+  const lines = String(narasi || '').split('\n');
+  const sections = [];
+  for (const line of lines) {
+    const m = line.match(/^\s*([A-Za-z][A-Za-z ]{2,40}):\s*(.*)$/);
+    if (m) sections.push({ label: m[1].trim().toLowerCase(), text: m[2].trim() });
+    else if (line.trim()) {
+      if (sections.length) sections[sections.length - 1].text += ` ${line.trim()}`;
+      else sections.push({ label: '', text: line.trim() });
+    }
+  }
+  if (!sections.some((x) => x.label)) return String(narasi || '').trim();
+  return sections.filter((x) => x.label.startsWith('alasan') || x.label === '').map((x) => x.text).join('\n');
 }
 
 // Live soil sensor: an ESP32 streams packets over the Pi's UART, the backend
@@ -190,6 +269,9 @@ export function Detection() {
   const [cameraError, setCameraError] = useState(null);
   const [capturedLocation, setCapturedLocation] = useState(null);
   const [camMax, setCamMax] = useState(false); // fullscreen (maximize) view in camera mode
+  const [maskOverlay, setMaskOverlay] = useState(false); // leaf-mask overlay on the preview only
+  const streamSrc = `/api/camera/stream${maskOverlay ? '?overlay=1' : ''}`;
+  const [cameraReset, setCameraReset] = useState({ state: 'idle', n: 0 }); // idle|busy|done|error
   const [zoneSave, setZoneSave] = useState({ state: 'idle' }); // idle|saving|saved|empty|error
   const fileRef = useRef(null);
   const fileObj = useRef(null);
@@ -230,6 +312,21 @@ export function Detection() {
   function switchMode(next) {
     if (mode === 'camera' && next !== 'camera') stopCamera();
     setMode(next);
+  }
+
+  // One tap back to a known state: every camera control to its default, preview at the
+  // default 20 fps, mask overlay off. The preset panel is remounted so its sliders
+  // show the reset values too. A saved preset stays on disk.
+  async function resetCamera() {
+    setCameraReset((r) => ({ ...r, state: 'busy' }));
+    try {
+      await resetCameraDefaults();
+      setMaskOverlay(false);
+      setCameraReset((r) => ({ state: 'done', n: r.n + 1 }));
+    } catch (err) {
+      setCameraReset((r) => ({ ...r, state: 'error', message: err.message }));
+    }
+    setTimeout(() => setCameraReset((r) => (r.state === 'busy' ? r : { ...r, state: 'idle' })), 2500);
   }
 
   async function capturePhoto() {
@@ -286,6 +383,7 @@ export function Detection() {
         usedSoil: !!r.used_soil,
         overlay: r.overlay_b64 || null, // YOLO-seg mask overlay (JPEG base64), null if nothing localized
         nDetections: r.n_detections ?? null,
+        lesionPercent: r.lesion_percent ?? null, // % of the leaf under the detector's masks
         detectionId: r.detection_id || null, // DB row id, to attach the AI narrative later
       });
 
@@ -300,6 +398,9 @@ export function Detection() {
       }
     } catch (err) {
       setResult({ state: 'error', message: err.message });
+      // Detection failed, so nothing reached the zone - drop the "saving…" banner
+      // instead of leaving it spinning forever.
+      if (inZoneMode) setZoneSave({ state: 'idle' });
     }
   }
 
@@ -363,7 +464,7 @@ export function Detection() {
                 ) : streaming ? (
                   // Live MJPEG feed from the backend (server/app/routes/camera.py) -
                   // the browser's own camera API can't read this webcam, see note above.
-                  <img src="/api/camera/stream" alt="Live kamera" className="h-full w-full object-cover" />
+                  <img src={streamSrc} alt="Live kamera" className="h-full w-full object-cover" />
                 ) : (
                   <span>📹<br /><br />{cameraError || 'Kamera belum aktif'}</span>
                 )}
@@ -372,6 +473,16 @@ export function Detection() {
                     <div className="absolute bottom-2 left-2">
                       <LocationBadge status={locationStatus} location={liveLocation} />
                     </div>
+                    <button
+                      type="button"
+                      onClick={resetCamera}
+                      disabled={cameraReset.state === 'busy'}
+                      title={cameraReset.state === 'error' ? cameraReset.message : 'Kembalikan semua pengaturan kamera ke default (20 fps)'}
+                      className={`absolute left-2 top-2 inline-flex items-center gap-1 rounded-full px-2.5 py-1.5 text-xs font-semibold text-white backdrop-blur transition-colors ${cameraReset.state === 'error' ? 'bg-red-600/80' : 'bg-black/55 hover:bg-black/70'}`}
+                    >
+                      {cameraReset.state === 'busy' ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
+                      {cameraReset.state === 'busy' ? 'Mereset…' : cameraReset.state === 'done' ? 'Default ✓' : cameraReset.state === 'error' ? 'Gagal reset' : 'Reset kamera'}
+                    </button>
                     <button
                       type="button"
                       onClick={() => setCamMax(true)}
@@ -394,6 +505,8 @@ export function Detection() {
               {!streaming && capturedLocation && (
                 <LocationBadge status="ok" location={capturedLocation} />
               )}
+              {streaming && <CameraIndicators overlay={maskOverlay} onOverlayChange={setMaskOverlay} />}
+              {streaming && <CameraTuningPanel key={cameraReset.n} />}
             </>
           )}
         </Card>
@@ -475,7 +588,7 @@ export function Detection() {
             </button>
           </div>
           <div className="relative min-h-0 flex-1">
-            <img src="/api/camera/stream" alt="Live kamera (layar penuh)" className="h-full w-full object-contain" />
+            <img src={streamSrc} alt="Live kamera (layar penuh)" className="h-full w-full object-contain" />
           </div>
           <div className="flex gap-3 p-4">
             <Button variant="outline" className="flex-1 border-white/30 bg-white/10 text-white hover:bg-white/20" onClick={stopCamera} disabled={capturing}>Batal</Button>
@@ -540,6 +653,48 @@ function ZoneSaveStatus({ zoneSave, zoneCode, onBack }) {
   );
 }
 
+// "Perdalam via AI" result, one source per topic: the model's reasoning (from narasi),
+// prevention as a list (dataset text split into items), control from the structured
+// fields. Falls back to the plain text if the reply has no structured diagnosis.
+function AiDeepen({ ai }) {
+  const navigate = useNavigate();
+  const p = ai.prediksi;
+  if (!p) return <div className="whitespace-pre-wrap rounded-xl border border-leaf/30 bg-leaf/5 p-3 text-sm text-foreground">{ai.text}</div>;
+  const reason = narasiReason(p.narasi_gemma);
+  const prevention = splitAdvice(p.pencegahan);
+  const peng = p.pengendalian || {};
+  return (
+    <div className="space-y-2.5 rounded-xl border border-leaf/30 bg-leaf/5 p-3 text-sm text-foreground">
+      <p className="flex items-center gap-1.5 text-xs font-bold uppercase tracking-wide text-forest"><Sparkles className="h-3.5 w-3.5" /> Pendalaman AI</p>
+      {reason && <p className="whitespace-pre-wrap leading-relaxed">{reason}</p>}
+      {prevention.length > 0 && (
+        <div>
+          <p className="font-semibold text-forest">Pencegahan</p>
+          <ul className="mt-0.5 list-disc space-y-0.5 pl-5">{prevention.map((x) => <li key={x}>{x}</li>)}</ul>
+        </div>
+      )}
+      {(peng.jenis || peng.bahan_aktif?.length || peng.contoh_produk?.length || peng.catatan) && (
+        <div>
+          <p className="font-semibold text-forest">Pengendalian{peng.jenis ? ` · ${peng.jenis}` : ''}</p>
+          <ul className="mt-0.5 list-disc space-y-0.5 pl-5">
+            {peng.bahan_aktif?.length > 0 && <li><span className="font-medium">Bahan aktif:</span> {peng.bahan_aktif.join(', ')}</li>}
+            {peng.contoh_produk?.length > 0 && <li><span className="font-medium">Contoh produk:</span> {peng.contoh_produk.join(', ')}</li>}
+            {peng.catatan && <li>{peng.catatan}</li>}
+          </ul>
+        </div>
+      )}
+      {ai.sessionId && (
+        <div className="flex flex-wrap items-center gap-2 border-t border-leaf/20 pt-2.5">
+          <Button size="sm" onClick={() => navigate(`/chatbot?session=${ai.sessionId}`)}>
+            <MessageCircle className="h-4 w-4" /> Lanjutkan tanya di Chatbot
+          </Button>
+          <span className="text-xs text-muted-foreground">Tanyakan dosis, waktu semprot, atau pencegahan untuk kasus ini.</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Diagnosis({ result, issues, sensorConnected, onRun, canRun }) {
   const [ai, setAi] = useState({ state: 'idle' });
   // Reset any prior AI narrative whenever a new detection result comes in.
@@ -547,6 +702,7 @@ function Diagnosis({ result, issues, sensorConnected, onRun, canRun }) {
 
   const top = result.top;
   const info = top ? DISEASE_INFO[top.name] : null;
+  const severity = severityOf(result.lesionPercent);
 
   async function askAI() {
     const query = buildSymptomQuery(result);
@@ -554,13 +710,34 @@ function Diagnosis({ result, issues, sensorConnected, onRun, canRun }) {
     setAi({ state: 'loading' });
     try {
       // Send the disease's SYMPTOMS (not its name) so the LLM's symptom-classifier agrees
-      // with our CV detection and returns relevant narasi + pengendalian.
-      const r = await sendChatMessage(query);
-      setAi({ state: 'ok', text: r.response });
-      // Persist to the detection row + LLM chat history (best-effort; never block the UI).
-      if (result.detectionId) {
-        saveDetectionNarrative(result.detectionId, query, r.response).catch(() => {});
+      // with our CV detection and returns relevant narasi + pengendalian. It goes through the
+      // Jetson agent, which diagnoses exactly like /api/chat but also opens a *case* - so the
+      // conversation can be continued in the Chatbot with follow-up questions.
+      const r = await agentNewCase({ gejala: query });
+      if (!r?.ok) throw new Error(r?.message || 'Pendalaman AI gagal.');
+      const meta = agentDiagnosisMeta(r);
+      const text = `Diagnosis: ${meta.hama || '-'}\n\n${summarizeDiagnosis(r.diagnosis)}`;
+      setAi({ state: 'ok', text, prediksi: r.diagnosis?.prediksi || null, sessionId: null });
+
+      // Persist to the detection row + a chat session that continues this case (best-effort;
+      // never blocks the result). Without a saved detection, build the session directly.
+      const prompt = `📷 Pendalaman hasil deteksi foto: ${prettyDisease(top.name)}.\nGejala acuan: ${query}`;
+      let sessionId = null;
+      try {
+        if (result.detectionId) {
+          sessionId = (await saveDetectionNarrative(result.detectionId, prompt, text, { meta, agentCaseId: r.case_id }))?.session_id || null;
+        }
+      } catch { /* fall through to the direct session below */ }
+      if (!sessionId) {
+        try {
+          const s = await createChatSession();
+          await addChatMessage(s.id, { sender: 'user', text: prompt });
+          await addChatMessage(s.id, { sender: 'bot', text, meta });
+          await updateChatSession(s.id, { agentCaseId: r.case_id });
+          sessionId = s.id;
+        } catch { /* the result stays on screen; only the Chatbot hand-off is unavailable */ }
       }
+      setAi((a) => (a.state === 'ok' ? { ...a, sessionId } : a));
     } catch (err) {
       setAi({ state: 'error', text: err.message });
     }
@@ -574,12 +751,21 @@ function Diagnosis({ result, issues, sensorConnected, onRun, canRun }) {
           <div className="space-y-3">
             <div className="flex flex-wrap items-center gap-3">
               <span className="text-lg font-bold text-foreground">{prettyDisease(top.name)}</span>
-              <span className="rounded-full bg-harvest/15 px-2.5 py-0.5 text-xs font-semibold text-harvest">{(result.confidence * 100).toFixed(0)}% yakin</span>
+              <span className="rounded-full bg-harvest/15 px-2.5 py-0.5 text-xs font-semibold text-harvest" title={`skor model ${(result.confidence * 100).toFixed(0)}%`}>keyakinan {confidenceLabel(result.confidence)}</span>
+              {severity && (
+                <span className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ${severity.tone}`} title="Dari luas area bercak yang dilingkari detektor dibanding bagian tanaman di foto">
+                  keparahan {severity.label} · ±{result.lesionPercent.toFixed(result.lesionPercent < 10 ? 1 : 0)}% daun
+                </span>
+              )}
               <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-semibold ${result.usedSoil ? 'bg-leaf/12 text-forest' : 'bg-muted text-muted-foreground'}`}>
                 {result.usedSoil ? '🌱 disesuaikan dengan data tanah' : 'tanpa data tanah'}
               </span>
             </div>
             <div className="h-2 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-leaf" style={{ width: `${result.confidence * 100}%` }} /></div>
+            <p className="text-[11px] text-muted-foreground">
+              Hasil model dari foto — cocokkan dengan pengamatan langsung di lapangan.
+              {severity && ' Keparahan adalah indikasi dari foto; foto dekat satu daun memberi angka paling akurat.'}
+            </p>
 
             {result.present.length > 1 && (
               <div className="flex flex-wrap gap-1.5">
@@ -592,7 +778,9 @@ function Diagnosis({ result, issues, sensorConnected, onRun, canRun }) {
             {info && (
               <div className="space-y-1.5 rounded-xl border border-border bg-background/60 p-3">
                 <p className="text-sm text-muted-foreground">{info.deskripsi}</p>
-                <p className="text-sm"><span className="font-semibold text-forest">Penanganan:</span> {info.penanganan}</p>
+                {ai.state !== 'ok' && (
+                  <p className="text-sm"><span className="font-semibold text-forest">Penanganan:</span> {info.penanganan}</p>
+                )}
               </div>
             )}
 
@@ -603,7 +791,7 @@ function Diagnosis({ result, issues, sensorConnected, onRun, canRun }) {
               <p className="text-xs text-muted-foreground">Pendalaman via AI belum tersedia untuk penyakit ini (di luar basis pengetahuan LLM).</p>
             )}
             {ai.state === 'loading' && <p className="flex items-center gap-2 text-sm text-forest"><Loader2 className="h-4 w-4 animate-spin" /> Meminta penjelasan AI… (bisa 1–3 menit)</p>}
-            {ai.state === 'ok' && <div className="whitespace-pre-wrap rounded-xl border border-leaf/30 bg-leaf/5 p-3 text-sm text-foreground">{ai.text}</div>}
+            {ai.state === 'ok' && <AiDeepen ai={ai} />}
             {ai.state === 'error' && <p className="text-sm text-destructive">⚠️ {ai.text}</p>}
           </div>
         ) : (
@@ -620,7 +808,10 @@ function Diagnosis({ result, issues, sensorConnected, onRun, canRun }) {
           {result.overlay ? (
             <>
               <img src={`data:image/jpeg;base64,${result.overlay}`} alt="Segmentasi area penyakit" className="w-full rounded-xl border border-border" />
-              <p className="text-xs text-muted-foreground">{result.nDetections} area penyakit dilingkari &amp; diberi mask oleh detektor.</p>
+              <p className="text-xs text-muted-foreground">
+                {result.nDetections} area penyakit dilingkari &amp; diberi mask oleh detektor
+                {result.lesionPercent != null && <> — menutupi ±{result.lesionPercent.toFixed(1)}% bagian tanaman di foto</>}.
+              </p>
             </>
           ) : (
             <p className="text-xs text-muted-foreground">Detektor tidak menemukan area penyakit terlokalisasi — diagnosis berasal dari analisis seluruh daun.</p>

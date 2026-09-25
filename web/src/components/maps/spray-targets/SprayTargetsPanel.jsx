@@ -1,4 +1,4 @@
-import { Loader2, MapPin } from "lucide-react";
+import { Loader2, MapPin, PenLine } from "lucide-react";
 
 import { PRODUCTS, productById } from "@/lib/gcs/product-doses";
 import { chamberDisplayLabel } from "@/lib/gcs/spray-overlay";
@@ -88,6 +88,7 @@ export function SprayTargetsPanel({
   onFocusTarget,
   chamberProducts,
   onChamberProductChange,
+  onStartManualDraw,
 }) {
   return (
     <div className="mt-3 border-t border-gray-100 pt-3">
@@ -119,6 +120,16 @@ export function SprayTargetsPanel({
         chamberProducts={chamberProducts}
         onChamberProductChange={onChamberProductChange}
       />
+      {onStartManualDraw && (
+        <button
+          type="button"
+          onClick={onStartManualDraw}
+          className="mt-2 flex h-9 w-full items-center justify-center gap-1.5 rounded-xl border border-amber-300 bg-amber-50 text-[11px] font-black text-amber-800 transition-colors hover:bg-amber-100"
+          title="Tambah zona semprot dengan menggambar di peta; zona otomatis di bawahnya dipotong"
+        >
+          <PenLine className="h-3.5 w-3.5" /> Gambar Zona Manual
+        </button>
+      )}
       {features.length > 0 && (
         <div className="mt-2 overflow-hidden rounded-xl border border-gray-200 bg-white">
           <div className="grid grid-cols-[58px_minmax(0,1fr)_92px_54px] items-center justify-items-center gap-2 border-b border-gray-100 bg-gray-50 px-2.5 py-2">
@@ -151,7 +162,10 @@ export function SprayTargetsPanel({
                   key={targetId}
                   className="grid w-full grid-cols-[58px_minmax(0,1fr)_92px_54px] items-center justify-items-center gap-2 border-b border-gray-100 px-2.5 py-2 last:border-b-0"
                 >
-                  <span className="text-center text-[12px] font-black text-gray-950">
+                  <span
+                    className={`text-center text-[12px] font-black ${props.source === "manual" ? "text-amber-700" : "text-gray-950"}`}
+                    title={props.source === "manual" ? "Zona manual (digambar)" : "Zona otomatis (NDVI)"}
+                  >
                     {props.zone_code ?? `Z${String(index + 1).padStart(2, "0")}`}
                   </span>
                   <span className="min-w-0 truncate text-center text-[11px] font-black tabular-nums text-gray-700">

@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   Info,
   Loader2,
   MapPin,
@@ -41,6 +42,9 @@ export function NdviZonesPanel({
   onSettingChange,
   onGenerate,
   onApprove,
+  approveImpact,
+  onConfirmApprove,
+  onCancelApprove,
   onFocusZone,
   onDeleteZone,
 }) {
@@ -218,6 +222,51 @@ export function NdviZonesPanel({
           Approve Zones
         </button>
       </div>
+
+      {approveImpact && (
+        <div className="mt-2 rounded-2xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs text-amber-900">
+          <div className="flex items-center gap-1.5 font-black">
+            <AlertTriangle className="h-3.5 w-3.5" /> Zona lama akan diganti
+          </div>
+          <ul className="mt-1.5 list-disc space-y-0.5 pl-4 font-semibold">
+            {approveImpact.hpt_total > 0 && (
+              <li>
+                {approveImpact.hpt_moved} dari {approveImpact.hpt_total} HPT dipindah ke zona baru
+                {approveImpact.hpt_unzoned > 0 && (
+                  <>; <b>{approveImpact.hpt_unzoned} tidak punya zona baru</b> dan akan dilepas dari zona (data tetap tersimpan)</>
+                )}
+              </li>
+            )}
+            {approveImpact.manual_total > 0 && (
+              <li>
+                {approveImpact.manual_kept} dari {approveImpact.manual_total} pengaturan chamber manual dipertahankan
+                {approveImpact.manual_reset > 0 && (
+                  <>; <b>{approveImpact.manual_reset} direset</b> karena tidak cocok dengan zona baru</>
+                )}
+              </li>
+            )}
+          </ul>
+          <div className="mt-2 grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              onClick={onCancelApprove}
+              disabled={approveLoading}
+              className="h-8 rounded-xl border border-amber-300 bg-white text-[11px] font-black text-amber-900 hover:bg-amber-100"
+            >
+              Batal
+            </button>
+            <button
+              type="button"
+              onClick={onConfirmApprove}
+              disabled={approveLoading}
+              className="flex h-8 items-center justify-center gap-1.5 rounded-xl bg-emerald-800 text-[11px] font-black text-white hover:bg-emerald-900 disabled:bg-gray-300"
+            >
+              {approveLoading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+              Lanjut Approve
+            </button>
+          </div>
+        </div>
+      )}
 
       {error && (
         <div className="mt-2 rounded-2xl bg-red-50 px-3 py-2 text-xs font-semibold text-red-600">

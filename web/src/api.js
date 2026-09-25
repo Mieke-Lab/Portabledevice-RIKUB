@@ -22,7 +22,13 @@ async function request(url, options = {}, timeout = TIMEOUT, externalSignal) {
       signal: controller.signal,
       headers: { 'Content-Type': 'application/json', ...options.headers },
     });
-    if (!res.ok) throw new Error(`HTTP Error ${res.status}: ${res.statusText}`);
+    if (!res.ok) {
+      // Prefer the server's own message (e.g. the 429 rate-limit text or the Jetson
+      // proxy's "tidak dapat dihubungi") over a bare status line.
+      const body = await res.json().catch(() => null);
+      const detail = body?.message || (typeof body?.detail === 'string' ? body.detail : null);
+      throw new Error(detail || `HTTP Error ${res.status}: ${res.statusText}`);
+    }
     return await res.json();
   } catch (err) {
     if (err.name === 'AbortError') {
@@ -48,7 +54,7 @@ async function request(url, options = {}, timeout = TIMEOUT, externalSignal) {
 // `prediksi` (prediksi.narasi_gemma, prediksi.pencegahan, prediksi.pengendalian,
 // ...), not a plain {response}/{analysis} shape. Flatten it into text so
 // callers get a readable message instead of a raw JSON dump.
-function summarizeDiagnosis(data) {
+export function summarizeDiagnosis(data) {
   const prediksi = data?.prediksi;
   const parts = [];
   if (prediksi?.narasi_gemma) parts.push(prediksi.narasi_gemma);
@@ -108,6 +114,69 @@ export function analyzeParameters({ gejala, suhu, kelembapan, ph, pH }, { signal
 // browser localStorage — WebKitGTK inside the pywebview kiosk does not
 // reliably keep localStorage across process restarts, so history vanished
 // every time the kiosk window was closed and reopened.
+// --- Interactive agent on the Jetson (agent_api.py), through the Pi proxy -------------
+// A conversation revolves around one *case*: the first message is diagnosed exactly like
+// /api/chat, later questions ("obatnya apa?") are answered about that same case, grounded
+// on the diagnosis + the Obsidian knowledge vault + the chat so far. Each case is also a
+// Markdown note in the Jetson's vault.
+
+// One chat box, routed by the agent itself: a question while a case is active -> follow-up,
+// anything else -> new diagnosis. Response: {intent: 'diagnosa' | 'tanya', case_id, ...}.
+export function agentMessage({ teks, caseId }, { signal } = {}) {
+  return request(
+    '/api/agent/pesan',
+    { method: 'POST', body: JSON.stringify({ teks, case_id: caseId || null }) },
+    CHATBOT_TIMEOUT,
+    signal,
+  );
+}
+
+// New case from the parameter panel (symptoms + suhu/kelembapan/pH, sent as strings).
+export function agentNewCase({ gejala, suhu, kelembapan, ph }, { signal } = {}) {
+  return request(
+    '/api/agent/kasus',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        gejala,
+        suhu: String(suhu ?? ''),
+        kelembapan: String(kelembapan ?? ''),
+        pH: String(ph ?? ''),
+      }),
+    },
+    CHATBOT_TIMEOUT,
+    signal,
+  );
+}
+
+// Compact, render-ready payloads stored with the chat message (chat_messages.meta), so
+// history re-renders the same cards without asking the Jetson again.
+export function agentDiagnosisMeta(r) {
+  const p = r?.diagnosis?.prediksi || {};
+  return {
+    kind: 'diagnosis',
+    case_id: r?.case_id,
+    mode: r?.kasus?.mode,
+    hama: p.hama,
+    label_keyakinan: p.label_keyakinan,
+    skor: p.skor,
+    narasi: p.narasi_gemma || null,
+    pencegahan: p.pencegahan || null,
+    pengendalian: p.pengendalian || null,
+    gejala_serupa: Array.isArray(p.contoh_gejala_serupa) ? p.contoh_gejala_serupa.slice(0, 3) : [],
+    catatan: r?.kasus?.catatan || null,
+  };
+}
+
+export function agentFollowupMeta(r) {
+  return {
+    kind: 'followup',
+    case_id: r?.case_id,
+    ditolak: !!r?.ditolak,
+    pengetahuan: Array.isArray(r?.pengetahuan) ? r.pengetahuan : [],
+  };
+}
+
 export function listChatSessions() {
   return request('/api/chat/sessions?include_messages=true');
 }
@@ -116,10 +185,17 @@ export function createChatSession() {
   return request('/api/chat/sessions', { method: 'POST' });
 }
 
-export function addChatMessage(sessionId, { sender, text, isError = false }) {
+export function updateChatSession(sessionId, { agentCaseId }) {
+  return request(`/api/chat/sessions/${sessionId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ agent_case_id: agentCaseId ?? null }),
+  });
+}
+
+export function addChatMessage(sessionId, { sender, text, isError = false, meta = null }) {
   return request(`/api/chat/sessions/${sessionId}/messages`, {
     method: 'POST',
-    body: JSON.stringify({ sender, text, is_error: isError }),
+    body: JSON.stringify({ sender, text, is_error: isError, meta }),
   });
 }
 
@@ -136,11 +212,13 @@ export async function listDetections(limit = 50) {
 }
 
 // Persist a "Perdalam via AI" result onto the detection row AND the LLM chat history.
-export async function saveDetectionNarrative(id, prompt, narrative) {
+// Returns {ok, session_id}: the deepening is also saved as a chat session (Riwayat), which
+// continues the agent case when agentCaseId is given.
+export async function saveDetectionNarrative(id, prompt, narrative, { meta = null, agentCaseId = null } = {}) {
   const res = await fetch(`/api/detections/${id}/narrative`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prompt, narrative }),
+    body: JSON.stringify({ prompt, narrative, meta, agent_case_id: agentCaseId }),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return await res.json();
@@ -188,3 +266,24 @@ export async function detectDisease(imageFile, { lat, lng, source, polygonId, zo
     clearTimeout(timer);
   }
 }
+
+// Manual camera tuning for the 'Siang Terik Sawah' preset (server/app/camera_tuning.py).
+// Errors carry the backend's own message (e.g. unsupported control, camera missing).
+async function cameraCall(path, body) {
+  const res = await fetch(`/api/camera${path}`, body === undefined ? {} : {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+  return data;
+}
+
+export const getCameraTuning = () => cameraCall('/tuning');
+export const setCameraTuning = (values) => cameraCall('/tuning', values);
+// Every camera control back to its default + preview 20 fps (camera_tuning.reset_defaults).
+export const resetCameraDefaults = () => cameraCall('/tuning/reset', {});
+export const saveCameraPreset = () => cameraCall('/preset/save', {});
+export const loadCameraPreset = () => cameraCall('/preset/load', {});
+export const getCameraMetrics = () => cameraCall('/metrics');
