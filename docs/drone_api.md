@@ -71,7 +71,7 @@ the telemetry snapshot documented in [its own section](#diagnostics):
 
 | gRPC status | When |
 |-------------|------|
-| `FAILED_PRECONDITION` | Controller unavailable (no FCU/ROS), or a fire-and-poll command is already running. |
+| `FAILED_PRECONDITION` | Controller unavailable (no FCU/ROS), a fire-and-poll command is already running, a mapping/spray session is already armed (`PushCaptureMission`, `ResumeMappingMission`, `PushSprayMission`), or `ResumeMappingMission` targets a session that is not resumable. |
 | `INVALID_ARGUMENT` | Required field missing or invalid (e.g. `mode`, `x/y/z`, bad `method`). |
 | `DEADLINE_EXCEEDED` | A blocking command did not complete within `timeout` (often: FCU not connected). |
 | `INTERNAL` | Unexpected failure starting/executing a command. |
@@ -309,34 +309,45 @@ These predate the standard-command endpoints and remain unchanged:
 
 Fly a **photogrammetry survey**: the frontend uploads a set of discrete capture
 (photo) stations; the backend flies them as a `LOITER_UNLIM` mission, triggering
-a photo at each. At mission end the mapping monitor auto-creates a
-`MappingJobService` **session** (`CreateSession` + `StartStitching`) from the
-captured frames, so the run appears in `ListJobs` with no extra client call —
-see [mapping.md](mapping.md). Tie a flight to its session via
-`MappingMissionStatus.odm_job_id`.
+a photo at each. The `MappingJobService` **session** is created **at push time**:
+`PushCaptureMission` returns its `session_id` (the value you passed, or a
+generated one) and the session is in `ListJobs` **from takeoff on** — no extra
+client call, no second folder. Its ODM `status` stays `unstitched` for the whole
+flight; where the *flight* has got to (which points are captured, whether it is
+paused, whether it can be resumed) is the session's persisted
+[`capture` block](mapping.md#capture-block). Frames land straight in that
+session's `raw/`, and the ODM stitch starts by itself once the last point is
+captured — see [mapping.md](mapping.md).
+
+A survey is flown in one or more **legs**. `PushCaptureMission` starts leg 1,
+`PauseMappingMission` ends the current leg early (return, land, *then* secure the
+frames), `ResumeMappingMission` uploads a plan for the points still owed, and every
+leg is flown with the same `ExecuteMission { mode: "mapping", job_id: session_id }`.
+`CancelMappingMission` drops the mission outright.
 
 **Lifecycle** (mirrors the spraying flow):
 
 ```text
-PushCaptureMission { capture_points, altitude, hold_time, session_id }  # upload LOITER_UNLIM survey
-ExecuteMission     { mode: "mapping", job_id }                          # arm → takeoff → AUTO
-MappingMissionStatus {}                                                  # poll captures + odm_job_id
+PushCaptureMission { capture_points, altitude, hold_time, session_id }  # upload LOITER_UNLIM survey → session exists
+ExecuteMission     { mode: "mapping", job_id: session_id }              # arm → takeoff → AUTO
+MappingMissionStatus {}                                                  # poll the live leg
+GetJob             { session_id }                                        # persisted flight state in `capture`
 ```
 
 ### `PushCaptureMission`
 
-Upload a discrete-capture-point mapping mission. **Blocking** (bounded by
-`timeout`); returns the status object. Refused with `FAILED_PRECONDITION` while a
-mapping **or** spray session is already active.
+Upload a discrete-capture-point mapping mission and create its session.
+**Blocking** (bounded by `timeout`); returns the status object. Refused with
+`FAILED_PRECONDITION` while a mapping **or** spray session is already active.
 
 **Request**
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `capture_points` | `[{lat, lng}, …]` | — | **Required.** Ordered photo stations; the drone visits each in turn, holding for a capture. |
-| `altitude` | float | `5.0` | Survey altitude (m AGL). |
-| `hold_time` | float | `0.0` | Seconds to loiter at each station before capturing / moving on. |
-| `session_id` | string | auto | Session id (also accepted as `job_id`); pass the same value as `ExecuteMission`'s `job_id`. |
+| `capture_points` | `[{lat, lng}, …]` | — | **Required.** Ordered photo stations; the drone visits each in turn, holding for a capture. Stored verbatim as the session's `capture.points`. |
+| `altitude` | float | `5.0` | Survey altitude (m AGL). Remembered as `capture.altitude` — the default for a later resume. |
+| `hold_time` | float | `0.0` | Seconds to loiter at each station before capturing / moving on. Remembered as `capture.hold_time`. |
+| `session_id` | string | auto | Session id (also accepted as `job_id`); pass the same value as `ExecuteMission`'s `job_id`. Becomes the `MappingJobService` session id. |
 
 ```json
 {
@@ -350,11 +361,17 @@ mapping **or** spray session is already active.
 }
 ```
 
-**Response:** status object. Then call `ExecuteMission { "mode": "mapping", "job_id": "map-abc123" }`.
+**Response:** status object, plus `session_id` — the id of the session that now
+exists (`GetJob { session_id }` already returns it with `status: "unstitched"`,
+`capture.state: "armed"`). Then call
+`ExecuteMission { "mode": "mapping", "job_id": "map-abc123" }`.
 
 ### `MappingMissionStatus`
 
-Poll the capture mission's progress. **Read-only**, never aborts.
+Poll the **current leg's** progress. **Read-only**, never aborts. This is the live
+view; the persisted, restart-proof view of the same flight is the session's
+[`capture` block](mapping.md#capture-block) via `GetJob` (which also has the
+per-point `captured` / `pending` lists this poll lacks).
 
 **Request:** `{}`
 
@@ -362,20 +379,147 @@ Poll the capture mission's progress. **Read-only**, never aborts.
 
 ```json
 {
-  "running": true, "session_id": "map-abc123", "phase": "capturing",
+  "running": true, "session_id": "map-abc123", "phase": "flying",
   "captures_done": 12, "total_captures": 48,
-  "odm_job_id": "", "last_error": ""
+  "odm_job_id": "map-abc123", "last_error": ""
 }
 ```
 
 | Field | Type | Meaning |
 |-------|------|---------|
-| `running` | bool | A capture mission is armed/flying. |
-| `session_id` | string | The armed mission's id (the `PushCaptureMission` value). |
-| `phase` | string | `idle` → `arming` → `capturing` → `complete` / `failed` / `canceled`. |
-| `captures_done` / `total_captures` | int | Photos taken so far / total stations. |
-| `odm_job_id` | string | The created `MappingJobService` session id, **populated at mission end** (empty while flying). Resolve it with `GetJob` / `GET /api/jobs/{id}`. |
+| `running` | bool | A capture leg is in progress (the monitor owns the session). `false` once the leg has settled — paused, done, failed or canceled — and when idle. |
+| `session_id` | string | The armed mission's id (the `PushCaptureMission` / `ResumeMappingMission` value). |
+| `phase` | string | Where the leg is. Current builds report the session's **`capture.state`** vocabulary: `armed` → `flying` → `returning` → `processing` → `paused` / `done` / `failed` / `canceled` (plus `interrupted` after a backend restart); `idle` when nothing is armed. Older builds use `idle` → `arming` → `capturing` → `complete` / `failed` / `canceled` — read `arming` as `armed`, `capturing` as `flying`, `complete` as `done`. Do not call `ResumeMappingMission` while the leg is still settling (`flying` / `returning` / `processing`); the resumable states are `paused`, `failed`, `interrupted` and `armed` — the same set as `capture.state` in `GetJob` (so a `failed` or `interrupted` phase is a *resume* case, not a dead end), see [ResumeMappingMission](#resumemappingmission) and mapping.md. |
+| `captures_done` / `total_captures` | int | Photos taken so far / total stations. This is the per-leg view, so expect a resumed leg to count only the points it is flying; the session-wide tally is `len(capture.captured)` / `len(capture.points)` in `GetJob`. |
+| `odm_job_id` | string | The `MappingJobService` session id — **equal to `session_id`, set from the push** (the session exists from the start; older builds left it empty until mission end). Resolve it with `GetJob` / `GET /api/jobs/{id}`. |
 | `last_error` | string | Failure reason, or empty. |
+
+### `PauseMappingMission`
+
+End the current leg early — typically a low battery — keeping every frame taken
+so far. Not a hover-in-place pause: the aircraft finishes (or aborts) the capture
+in progress, advances to the plan's trailing `NAV_RETURN_TO_LAUNCH`, flies back to
+**this leg's** takeoff point and lands. **Only after touchdown** are the frames
+pulled off the camera — retrieval switches it into USB mass-storage mode and drains
+the SD card, which must not happen in flight — so `capture.state` goes
+`returning` → `processing` → `paused`. Returns immediately; the pause itself takes
+as long as the flight home plus the drain.
+
+**Request:** `{}` — the armed mission is implied (only one can be active).
+
+**Response:** the status object. Poll `MappingMissionStatus` (`phase`) or `GetJob`
+(`capture.state`) until **`paused`**; only then call `ResumeMappingMission`.
+`capture.captured` then lists every point secured across all legs so far. Expected
+`FAILED_PRECONDITION` when no mapping mission is armed/flying.
+
+### `ResumeMappingMission`
+
+Start the next leg of a **resumable** session (`capture.state` in `paused`,
+`interrupted`, `armed`, `failed`): uploads a new `LOITER_UNLIM` plan for the points
+**not yet in `capture.captured`** — so the `pending` points of a failed leg are
+re-flown rather than left as a hole — and re-arms the mapping monitor on the same
+session. **Blocking** upload (bounded by `timeout`); returns the status object.
+Then call `ExecuteMission { "mode": "mapping", "job_id": session_id }` again: the
+aircraft takes off from wherever it is now, flies the remaining points, and returns
+to *this* leg's takeoff point (the FCU HOME recorded at arming), not to where the
+survey originally started.
+
+**Request**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `session_id` | string | — | **Required.** The session to continue (also accepted as `job_id`). |
+| `altitude` | float | the session's `capture.altitude` | Survey altitude (m AGL) for this leg. |
+| `hold_time` | float | the session's `capture.hold_time` | Per-station loiter (s) for this leg. |
+
+```json
+{ "session_id": "map-abc123" }
+```
+
+**Response:** status object. `MappingMissionStatus.session_id` / `odm_job_id` are
+the same id; `GetJob` shows `capture.state: "armed"` and `capture.leg` advanced.
+Refused with `FAILED_PRECONDITION` while another mapping **or** spray session is
+active, or when the session is not resumable (`done`, `canceled`, or still
+`returning` / `processing` — wait for `paused`). An unknown `session_id` is
+expected to come back as `NOT_FOUND`, and a session with nothing left to fly as
+`FAILED_PRECONDITION` — the exact codes for a bad resume are the backend's call;
+treat anything non-OK as "not resumed".
+
+### `CancelMappingMission`
+
+Drop the armed/flying mapping mission and tear the monitor down cleanly. The
+session folder, the frames already secured and `capture.captured` all survive;
+`capture.state` becomes `canceled` — which is **not** resumable, so the points
+still owed need a fresh `PushCaptureMission`. Use it to abort a run, or to release
+a session that was armed via `PushCaptureMission` / `ResumeMappingMission` but
+never executed (otherwise the next push is refused with `FAILED_PRECONDITION`).
+Expected to be safe to call when idle, like `CancelSprayMission`. It is the right
+way to stop a session whose `CancelJob` /
+`RemoveJob` is being refused for `capture.active`. Expect it to leave the aircraft
+where it is: to bring the drone home *and* keep the leg resumable, use
+`PauseMappingMission` instead; after cancelling an airborne mission, RTL / land it
+yourself.
+
+**Request:** `{}`. An optional `session_id` is forwarded when supplied and is
+expected to be checked against the armed mission's id.
+
+**Response:** the status object. Expect `MappingMissionStatus` to then report
+`running: false` with `phase: "canceled"`, and `GetJob` `capture.state: "canceled"`.
+
+### Multi-leg flow
+
+```text
+PushCaptureMission  { capture_points: [ ...20 points ], altitude: 20, session_id: "map-abc123" }
+  → status object, session_id "map-abc123"
+  → GetJob { session_id } already lists it: status "unstitched", capture.state "armed"
+ExecuteMission      { mode: "mapping", job_id: "map-abc123" }
+  → capture.state "flying"; MappingMissionStatus.captures_done climbs
+
+PauseMappingMission { }                       # battery low: come home, land, keep what we have
+  → capture.state "returning" → (touchdown) "processing" → "paused"
+  → poll MappingMissionStatus until phase == "paused"
+  → GetJob shows capture.captured [0..7] of 20, capture.leg 2
+
+  ... swap the battery, walk to a new takeoff spot ...
+
+ResumeMappingMission { session_id: "map-abc123" }   # new plan for the 12 remaining points
+ExecuteMission       { mode: "mapping", job_id: "map-abc123" }
+  ... flies the rest, returns to THIS leg's takeoff point, lands ...
+  → capture.state "done", status "stitching"   (the ODM stitch starts itself)
+GetJob { session_id }                          # poll until status == "ready"
+
+# abort at any time — frames + captured list survive, but the session is not resumable:
+CancelMappingMission {}
+```
+
+**Each leg is processed on landing.** Frames are retrieved, demosaiced to PNG,
+NDVI-georeferenced into `processed/` and merged into the session's `geo.txt` as
+soon as the leg is down; they accumulate in the one `raw/` folder across legs, and
+only the final leg starts the stitch. While a leg is in progress
+(`capture.active`), `StartStitching`, `CancelJob` and `RemoveJob` on that session
+are refused with `FAILED_PRECONDITION` unless `force: true` — see
+[mapping.md](mapping.md#deleting-a-mapping-session).
+
+### BFF routes
+
+The kiosk never speaks gRPC; the FastAPI server (`server/app/routes/drone.py`,
+`server/app/routes/jobs.py`) proxies these. gRPC `FAILED_PRECONDITION` surfaces as
+HTTP **409**, `NOT_FOUND` as **404**, `INVALID_ARGUMENT` as **400**; the
+`detail` field carries the gRPC message. `/api/drone/*` routes honour the
+`X-Drone-Addr` header to target another drone.
+
+| Route | gRPC | Notes |
+|-------|------|-------|
+| `POST /api/drone/mapping-mission` | `PushCaptureMission` | Body `{capture_points, altitude?, hold_time?, session_id?}`; `400` without at least one numeric `{lat, lng}`. Timeout 70 s. |
+| `GET /api/drone/mapping-mission` | `MappingMissionStatus` | Live per-leg view (above). |
+| `POST /api/drone/mapping-mission/pause` | `PauseMappingMission` | Body ignored; `{}` is forwarded. |
+| `POST /api/drone/mapping-mission/resume` | `ResumeMappingMission` | Body `{session_id, altitude?, hold_time?}` (`job_id` accepted as alias). `400` when `session_id` is missing, or `altitude` / `hold_time` is not a finite number (`altitude > 0`, `hold_time >= 0`; bools rejected). Optional keys are forwarded only when present and non-null. Timeout 70 s (it uploads a plan). |
+| `POST /api/drone/mapping-mission/cancel` | `CancelMappingMission` | Body `{}` or `{session_id}`; `session_id` is forwarded only when given. |
+| `POST /api/drone/mission/execute` | `ExecuteMission` | `{mode: "mapping", job_id: session_id}` flies the leg (first or resumed). |
+| `GET /api/jobs?capture_only=true` | `ListJobs {capture_only: true}` | Plain array of session objects. `capture_only` is forwarded only when true (default request stays `{}`). |
+| `GET /api/jobs/{id}` | `GetJob` | Session object: the `capture` block passes through untouched; `artifacts` (`raw_dir`, `stitched_tif`, `clusters_kml`, `processed_dir`) are rewritten to a browser-reachable host. |
+| `POST /api/jobs/{id}/cancel` | `CancelJob` | Optional JSON body `{force: true}`; `force` is forwarded only when it is JSON `true` (`400` if present and not a boolean; `null` = absent). `409` while `capture.active` without it. |
+| `DELETE /api/jobs/{id}?force=true` | `RemoveJob` | `force` is sent only when the query flag is set. `409` without it while `capture.active`, or when `capture.captured` is non-empty (the frames are the only copy). |
 
 ---
 

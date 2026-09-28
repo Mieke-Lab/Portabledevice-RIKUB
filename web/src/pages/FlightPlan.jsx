@@ -4,6 +4,7 @@ import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 import { ArrowLeft, Route as RouteIcon, MapPinned } from "lucide-react";
 import { BASE_LAYERS } from "@/components/maps/mapConfig";
+import { COVERAGE_PATH_STYLE, flagIcon } from "@/components/maps/flightPath";
 import { DroneTelemetryProvider } from "@/components/gcs/DroneTelemetryProvider";
 import { diagnosticsCoords, headingDeg, useDiagnostics } from "@/lib/gcs/diagnostics";
 import { PreFlightAuditModal } from "@/components/gcs/PreFlightAuditModal";
@@ -71,20 +72,6 @@ function drawDraft(map, groupRef, pts, center) {
   for (const p of pts) {
     L.circleMarker([p.lat, p.lng], { ...dot, radius: 4 }).addTo(group);
   }
-}
-
-function flagIcon(kind) {
-  const color = kind === "start" ? "#16a34a" : "#dc2626";
-  const label = kind === "start" ? "S" : "E";
-  return L.divIcon({
-    className: "",
-    iconSize: [30, 38],
-    iconAnchor: [4, 36],
-    html: `<div style="position:relative;width:30px;height:38px">
-      <div style="position:absolute;left:3px;top:0;width:2px;height:36px;background:#0f172a;border-radius:1px"></div>
-      <div style="position:absolute;left:5px;top:1px;width:18px;height:14px;background:${color};border-radius:3px;box-shadow:0 2px 6px rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;color:#fff;font-size:10px;font-weight:900;font-family:sans-serif">${label}</div>
-    </div>`,
-  });
 }
 
 function droneIcon(rotationDeg) {
@@ -380,12 +367,7 @@ export function FlightPlan() {
 
     if (pathLayer.current) pathLayer.current.setLatLngs(latlngs);
     else
-      pathLayer.current = L.polyline(latlngs, {
-        color: "#059669",
-        weight: 3,
-        opacity: 0.95,
-        interactive: false,
-      }).addTo(m);
+      pathLayer.current = L.polyline(latlngs, COVERAGE_PATH_STYLE).addTo(m);
 
     if (startMarker.current) {
       startMarker.current.setLatLng(start);

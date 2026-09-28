@@ -1,12 +1,17 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   ArrowLeft, Plus, Search, RefreshCw, FolderOpen, Loader2, Layers,
   Image as ImageIcon, Calendar, X, AlertTriangle, MapPinned, Sprout, Plane,
+  PlaneTakeoff, Play, Pause,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import { fetchJobs, createJobFromFolder } from "@/lib/gcs/api";
+import { fetchJobs, createJobFromFolder, pauseMappingMission } from "@/lib/gcs/api";
+import {
+  captureOf, captureStateMeta, captureProgress, captureSummary,
+  isCaptureSession, isCaptureInFlight, isCaptureResumable, isCapturePausable, needsAttention,
+} from "@/lib/gcs/mapping-capture";
 
 // Lifecycle of a MappingJobService session (docs/mapping.md). `busy` drives the
 // spinner + progress bar and marks a row as still in progress.
@@ -24,6 +29,46 @@ function statusMeta(status) {
   return STATUS_META[status] ?? STATUS_META.unstitched;
 }
 
+// A drone-flown session sits at `unstitched` for the WHOLE flight — `status`
+// tracks the ODM pipeline only (docs/mapping.md) — so "Menunggu" would be wrong
+// from takeoff until the last frame is secured. Show the flight state from the
+// `capture` block instead, and fall back to `status` once ODM has taken over.
+function displayMeta(job) {
+  const c = captureOf(job);
+  if (c && job.status === "unstitched") return captureStateMeta(c.state);
+  return statusMeta(job.status);
+}
+
+// The status buckets in the filter must agree with the badge (`displayMeta`):
+// a drone session at `unstitched` is labelled by `capture.state`, not `status`,
+// so bucketing on bare `status` would list "Sedang Terbang"/"Dijeda" cards under
+// "Menunggu" and hide "Misi Dibatalkan" from "Dibatalkan". In-flight states
+// (armed/flying/returning/processing/paused/interrupted) belong to the "Perlu
+// tindakan" / "Misi terbang" views, so they map to no status bucket; a cancelled
+// mission is "Dibatalkan"; a failed leg is "Gagal"; a session whose photos are
+// complete but which ODM has not picked up yet is genuinely "Menunggu".
+// The `status === "unstitched"` guard is deliberate: once ODM has taken over
+// (stitching/…/ready) the badge follows `status` again — even if the mission
+// was cancelled earlier and then force-stitched — so the bucket must too.
+function filterStatus(job) {
+  const c = captureOf(job);
+  if (!c || job.status !== "unstitched") return job.status;
+  if (c.state === "canceled") return "canceled";
+  if (c.state === "failed") return "failed";
+  if (c.state === "done") return "unstitched";
+  return null;
+}
+
+function jobId(job) {
+  return job.id || job.job_id;
+}
+
+// MappingPlan picks the session up from `?resume=` and flies the remaining
+// points as a new leg (ResumeMappingMission → ExecuteMission).
+function resumeUrl(job) {
+  return `/mapping/plan?resume=${encodeURIComponent(jobId(job))}`;
+}
+
 function formatDate(iso) {
   if (!iso) return "—";
   const date = new Date(iso);
@@ -35,19 +80,45 @@ function coverageHa(job) {
   return job.area_m2 != null ? `${(job.area_m2 / 10_000).toFixed(2)} ha` : "—";
 }
 
-function SessionCard({ job, onOpen }) {
-  const meta = statusMeta(job.status);
-  const title = job.name || job.area_name || job.id || job.job_id;
+// Enter/Space on a nested button must not also "open" the row/card it sits in
+// (the button's own click already navigates somewhere else).
+function activateSelf(handler) {
+  return (e) => {
+    if (e.target !== e.currentTarget) return;
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); handler(); }
+  };
+}
+
+function SessionCard({ job, onOpen, onResume }) {
+  const meta = displayMeta(job);
+  const odmMeta = statusMeta(job.status);
+  const title = job.name || job.area_name || jobId(job);
   // `progress` is a PERCENTAGE 0–100 (NodeODM's value, passed through unscaled by
   // PyODM — see docs/mapping.md). Clamp rather than rescale.
   const pct = Math.min(100, Math.max(0, Math.round(Number(job.progress) || 0)));
+
+  const c = captureOf(job);
+  const prog = captureProgress(job);
+  // Flight not finished yet: ODM hasn't taken over, so the card is about the
+  // mission (flight state, capture progress), not about stitching.
+  const flightPending = !!c && job.status === "unstitched";
+  const captureBar = flightPending && needsAttention(job);
+  const resumable = isCaptureResumable(job);
+  const legNo = Number.isInteger(c?.leg) ? c.leg : 0;
+  const flightError = c && (c.state === "failed" || c.state === "interrupted") && c.last_error;
+  // `image_count` is counted at ingest / when a stitch starts, NOT a live
+  // directory count — a half-flown session reports 0 and *looks* empty
+  // (docs/mapping.md), so use the capture counters while it is still 0.
+  const photoLabel = c && !(Number(job.image_count) > 0)
+    ? `${prog.photographed}/${prog.total} foto`
+    : `${job.image_count ?? 0} foto`;
 
   return (
     <Card
       role="button"
       tabIndex={0}
       onClick={() => onOpen(job)}
-      onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && onOpen(job)}
+      onKeyDown={activateSelf(() => onOpen(job))}
       className="group flex cursor-pointer flex-col overflow-hidden p-0 transition-all duration-200 hover:-translate-y-0.5 hover:shadow-[0_10px_28px_rgba(0,98,65,0.12)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-[0.99]"
     >
       <div className="relative flex h-24 items-center justify-center overflow-hidden bg-gradient-to-br from-forest to-leaf">
@@ -70,13 +141,22 @@ function SessionCard({ job, onOpen }) {
 
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
           <span className="inline-flex items-center gap-1"><Calendar className="h-3.5 w-3.5" /> {formatDate(job.created_at)}</span>
-          <span className="inline-flex items-center gap-1"><ImageIcon className="h-3.5 w-3.5" /> {job.image_count ?? 0} foto</span>
+          <span className="inline-flex items-center gap-1 tabular-nums"><ImageIcon className="h-3.5 w-3.5" /> {photoLabel}</span>
           {job.cluster_count != null && (
             <span className="inline-flex items-center gap-1"><Layers className="h-3.5 w-3.5" /> {job.cluster_count} zona</span>
           )}
+          {legNo > 1 && (
+            <span className="rounded-md bg-harvest/15 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-harvest">Leg {legNo}</span>
+          )}
         </div>
 
-        {meta.busy && (
+        {captureBar ? (
+          // photographed / total (secured + this leg's pending) — what the
+          // operator sees the aircraft doing; `captureProgress` handles the maths.
+          <div className="h-1.5 overflow-hidden rounded-full bg-muted">
+            <div className="h-full rounded-full bg-harvest transition-all duration-300" style={{ width: `${Math.max(4, prog.pct)}%` }} />
+          </div>
+        ) : odmMeta.busy && (
           <div className="h-1.5 overflow-hidden rounded-full bg-muted">
             <div
               className={`h-full rounded-full bg-harvest transition-all duration-300 ${job.status === "clustering" ? "animate-pulse" : ""}`}
@@ -87,16 +167,178 @@ function SessionCard({ job, onOpen }) {
         {job.status === "failed" && job.error && (
           <p className="line-clamp-2 text-xs text-destructive">{job.error}</p>
         )}
+        {flightError && (
+          <p className="line-clamp-2 text-xs text-destructive">{c.last_error}</p>
+        )}
 
         <div className="mt-auto flex items-center justify-between border-t border-border/70 pt-2.5">
           <div>
             <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Cakupan</p>
             <p className="text-sm font-bold text-foreground">{coverageHa(job)}</p>
           </div>
-          <span className="inline-flex items-center gap-1 text-xs font-bold text-leaf">
-            Buka <ArrowLeft className="h-3.5 w-3.5 rotate-180 transition-transform group-hover:translate-x-0.5" />
-          </span>
+          {resumable ? (
+            <Button
+              variant="accent"
+              size="sm"
+              className="h-8 px-3 text-xs"
+              onClick={(e) => { e.stopPropagation(); onResume(job); }}
+            >
+              <Play className="h-3.5 w-3.5" /> Lanjutkan
+            </Button>
+          ) : (
+            <span className="inline-flex items-center gap-1 text-xs font-bold text-leaf">
+              Buka <ArrowLeft className="h-3.5 w-3.5 rotate-180 transition-transform group-hover:translate-x-0.5" />
+            </span>
+          )}
         </div>
+      </div>
+    </Card>
+  );
+}
+
+// Tray order: whatever is physically happening (in the air / draining the camera)
+// first, then what waits on the operator (paused / interrupted / failed). Within
+// a group, newest plan first — keyed on created_at, NOT capture.updated_at, which
+// ticks every poll and would reorder rows under the operator's finger.
+function traySort(a, b) {
+  const fa = isCaptureInFlight(a) ? 0 : 1;
+  const fb = isCaptureInFlight(b) ? 0 : 1;
+  if (fa !== fb) return fa - fb;
+  return new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime();
+}
+
+function OngoingRow({ job, onOpen, onResume }) {
+  // Pause is a two-step inline confirm (no window.confirm on the kiosk).
+  // `pausedLeg` remembers which leg we asked to end so the "menjeda…" note stays
+  // up until a poll moves the session past flying/armed — and does not come back
+  // if this same row later flies a new leg (the leg number changes on resume).
+  const [confirming, setConfirming] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [pauseError, setPauseError] = useState(null);
+  const [pausedLeg, setPausedLeg] = useState(null);
+
+  const c = captureOf(job);
+  if (!c) return null;
+  const meta = captureStateMeta(c.state);
+  const prog = captureProgress(job);
+  const title = job.name || job.area_name || jobId(job);
+  const leg = Number.isInteger(c.leg) ? c.leg : 1;
+  const pausing = pausedLeg === leg && isCapturePausable(job);
+  const pausable = isCapturePausable(job) && !pausing;
+  const resumable = isCaptureResumable(job);
+  const flightError = (c.state === "failed" || c.state === "interrupted") && c.last_error;
+
+  async function confirmPause() {
+    setSubmitting(true);
+    setPauseError(null);
+    try {
+      // PauseMappingMission takes {} — it always targets the mission in the air.
+      // Landing comes first, the frames are only secured after touchdown
+      // (returning → processing → paused), so the row keeps polling meanwhile.
+      await pauseMappingMission();
+      setPausedLeg(leg);
+      setConfirming(false);
+    } catch (err) {
+      setPauseError(err instanceof Error ? err.message : "Gagal menjeda misi");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={() => onOpen(job)}
+      onKeyDown={activateSelf(() => onOpen(job))}
+      className="flex cursor-pointer flex-col gap-1.5 rounded-xl border border-border bg-card px-3 py-2.5 transition-colors hover:border-leaf/60 hover:bg-leaf/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+    >
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+        <span className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-[10px] font-bold uppercase tracking-wide ${meta.tone}`}>
+          {meta.busy
+            ? <Loader2 className="h-3 w-3 animate-spin" />
+            : <span className={`h-1.5 w-1.5 rounded-full ${meta.dot}`} />}
+          {meta.label}
+        </span>
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-sm font-bold text-forest">{title}</p>
+          <p className="truncate text-xs text-muted-foreground tabular-nums">
+            {captureSummary(job)}
+            {job.name && job.area_name ? ` · ${job.area_name}` : ""}
+          </p>
+        </div>
+        {/* Buttons live inside a clickable row: swallow the click so a tap on
+            "Jeda" never also opens the detail page. */}
+        <div className="flex shrink-0 items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
+          {confirming ? (
+            <>
+              <span className="text-xs font-semibold text-foreground">Jeda &amp; pulang?</span>
+              <Button size="sm" variant="accent" onClick={confirmPause} disabled={submitting}>
+                {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Pause className="h-4 w-4" />} Ya
+              </Button>
+              <Button size="sm" variant="outline" onClick={() => setConfirming(false)} disabled={submitting}>Batal</Button>
+            </>
+          ) : (
+            <>
+              {resumable && (
+                <Button size="sm" variant="accent" onClick={() => onResume(job)}>
+                  <Play className="h-4 w-4" /> Lanjutkan
+                </Button>
+              )}
+              {pausable && (
+                <Button size="sm" variant="outline" onClick={() => { setPauseError(null); setConfirming(true); }}>
+                  <Pause className="h-4 w-4" /> Jeda
+                </Button>
+              )}
+              <Button size="sm" variant="outline" onClick={() => onOpen(job)}>Buka</Button>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Outer (lighter) = photographed incl. this leg's pending frames; inner
+          (darker) = secured on disk. The gap is what a failed leg would re-fly. */}
+      <div className="relative h-1 overflow-hidden rounded-full bg-muted">
+        <div className="absolute inset-y-0 left-0 rounded-full bg-harvest/45 transition-all duration-300" style={{ width: `${prog.pct}%` }} />
+        <div className="absolute inset-y-0 left-0 rounded-full bg-harvest transition-all duration-300" style={{ width: `${prog.securedPct}%` }} />
+      </div>
+
+      {pausing && (
+        <p className="flex items-center gap-1.5 text-xs text-sky-700">
+          <Loader2 className="h-3.5 w-3.5 animate-spin" /> Menjeda — drone kembali &amp; mendarat…
+        </p>
+      )}
+      {pauseError && (
+        <p className="line-clamp-1 text-xs text-destructive">Gagal menjeda: {pauseError}</p>
+      )}
+      {flightError && (
+        <p className="line-clamp-1 text-xs text-destructive">{c.last_error}</p>
+      )}
+    </div>
+  );
+}
+
+// "Ongoing / needs attention" tray. A drone session is in ListJobs from the
+// moment its mission is pushed (docs/mapping.md), so every half-flown survey —
+// still airborne, paused for a battery swap, or orphaned by a backend restart —
+// surfaces here regardless of search/filter and can be resumed from the list.
+function OngoingTray({ jobs, onOpen, onResume }) {
+  return (
+    <Card className="mb-4 overflow-hidden border-harvest/40 p-0">
+      <div className="border-b border-border/70 bg-harvest/10 px-4 py-2.5">
+        <div className="flex items-center gap-2">
+          <PlaneTakeoff className="h-4 w-4 shrink-0 text-harvest" strokeWidth={2} />
+          <h2 className="text-sm font-bold text-forest">Misi Pemetaan Berjalan</h2>
+          <span className="rounded-full bg-harvest px-2 py-0.5 text-[11px] font-bold text-white tabular-nums">{jobs.length}</span>
+        </div>
+        <p className="mt-0.5 text-xs text-muted-foreground">
+          Sesi yang masih terbang, dijeda, atau terputus — bisa dilanjutkan kapan saja.
+        </p>
+      </div>
+      <div className="flex flex-col gap-2 p-3">
+        {jobs.map((job) => (
+          <OngoingRow key={jobId(job)} job={job} onOpen={onOpen} onResume={onResume} />
+        ))}
       </div>
     </Card>
   );
@@ -274,8 +516,10 @@ export function Mapping() {
         setError(null);
         // Every non-terminal status is transient (clustering runs automatically
         // right after a stitch — docs/mapping.md), so poll them all quickly and
-        // idle down only once nothing is in flight.
-        const anyBusy = list.some((j) => !TERMINAL.has(j.status));
+        // idle down only once nothing is in flight. A flying mission is spelled
+        // out explicitly: its `status` is a plain `unstitched` the whole time and
+        // the live part is `capture.state` / `capture.captured`.
+        const anyBusy = list.some((j) => !TERMINAL.has(j.status) || isCaptureInFlight(j));
         timer = setTimeout(tick, anyBusy ? 4000 : 20000);
       } catch (e) {
         if (!alive) return;
@@ -289,10 +533,19 @@ export function Mapping() {
     return () => { alive = false; clearTimeout(timer); };
   }, []);
 
+  // Tray rows are independent of search/filter on purpose — the tray exists so
+  // a half-flown survey can't be hidden away and forgotten.
+  const attention = useMemo(() => jobs.filter(needsAttention).sort(traySort), [jobs]);
+
   const visible = useMemo(() => {
     const q = search.trim().toLowerCase();
     return jobs
-      .filter((j) => statusFilter === "all" || j.status === statusFilter)
+      .filter((j) => {
+        if (statusFilter === "all") return true;
+        if (statusFilter === "capture") return isCaptureSession(j);
+        if (statusFilter === "attention") return needsAttention(j);
+        return filterStatus(j) === statusFilter;
+      })
       .filter((j) => {
         if (!q) return true;
         return [j.name, j.area_name, j.id, j.job_id]
@@ -303,7 +556,8 @@ export function Mapping() {
       .sort((a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime());
   }, [jobs, search, statusFilter]);
 
-  const openJob = (job) => navigate(`/mapping/${encodeURIComponent(job.id || job.job_id)}`);
+  const openJob = (job) => navigate(`/mapping/${encodeURIComponent(jobId(job))}`);
+  const resumeJob = (job) => navigate(resumeUrl(job));
 
   const inputCls =
     "w-full rounded-xl border border-border bg-card py-2.5 pl-10 pr-3 text-sm text-foreground outline-none transition-colors placeholder:text-muted-foreground/70 focus:border-leaf focus:ring-2 focus:ring-leaf/20";
@@ -333,6 +587,9 @@ export function Mapping() {
             onChange={(e) => setStatusFilter(e.target.value)}
           >
             <option value="all">Semua status</option>
+            {/* Flight views cut across `status` (a flying mission is `unstitched`). */}
+            <option value="attention">Perlu tindakan</option>
+            <option value="capture">Misi terbang</option>
             <option value="ready">Peta Siap</option>
             <option value="stitching">Menjahit Peta</option>
             <option value="clustering">Analisis Zona</option>
@@ -349,6 +606,10 @@ export function Mapping() {
           <div className="mb-4 flex items-center gap-2 rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
             <AlertTriangle className="h-4 w-4 shrink-0" /> {error}
           </div>
+        )}
+
+        {!loading && attention.length > 0 && (
+          <OngoingTray jobs={attention} onOpen={openJob} onResume={resumeJob} />
         )}
 
         {loading ? (
@@ -368,7 +629,7 @@ export function Mapping() {
             </h2>
             <p className="mt-1 max-w-sm text-sm text-muted-foreground">
               {jobs.length === 0
-                ? "Mulai pemetaan dari folder gambar, atau jalankan misi pemotretan drone — sesi dari misi muncul di sini otomatis."
+                ? "Mulai pemetaan dari folder gambar, atau jalankan misi pemotretan drone — sesi dari misi muncul di sini sejak lepas landas, termasuk misi yang dijeda atau terputus agar bisa dilanjutkan."
                 : "Coba ubah kata kunci pencarian atau filter status."}
             </p>
             {jobs.length === 0 && (
@@ -380,7 +641,7 @@ export function Mapping() {
         ) : (
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
             {visible.map((job) => (
-              <SessionCard key={job.id || job.job_id} job={job} onOpen={openJob} />
+              <SessionCard key={jobId(job)} job={job} onOpen={openJob} onResume={resumeJob} />
             ))}
           </div>
         )}

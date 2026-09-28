@@ -30,7 +30,8 @@ task by `backend_ref`).
 ```
 data/sessions/<id>/
   metadata.json      # session state (the response object below)
-  raw/               # input images (.jpg/.jpeg/.png/.tif/.tiff), saved before any stitch
+  raw/               # input images, saved before any stitch — plus geo.txt on the capture path
+  processed/         # per-frame NDVI GeoTIFF + KML (capture path only)
   stitched.tif       # ODM orthophoto, copied out of odm/
   clusters.kml       # vegetation-cluster polygons (mapping.generate_kml)
   odm/               # full NodeODM asset bundle
@@ -42,15 +43,18 @@ Two producers write into the same registry, so `ListJobs`/`GetJob` see both:
 
 1. **A client**, via `CreateSession` / `CreateOdmJob` (below).
 2. **The drone capture pipeline** — `DroneService.PushCaptureMission` (see
-   [drone_api.md](drone_api.md)). At mission end the mapping monitor calls
-   `CreateSession` + `StartStitching` itself against the *shared* `SessionStore`,
-   so a flight-created session **appears in `ListJobs` with no client call**. Its
-   `name` is the capture session id (`mapping-<hex>`); `area_name` and
-   `captured_at` are empty. To tie a flight to its session, read
-   `MappingMissionStatus.odm_job_id`.
+   [drone_api.md](drone_api.md)). The session is created **when the mission is
+   pushed**, not at mission end, so a mapping flight **appears in `ListJobs` from
+   takeoff onward** with its live progress in the [`capture`](#capture-block)
+   block. `PushCaptureMission` returns that session's `session_id`. The frames
+   land directly in this session's `raw/` — there is no second folder and no
+   second copy — and the ODM stitch starts only when the last point is captured.
 
-Capture-produced `raw/` folders hold **PNG** frames (demosaiced from MAPIR
-`.RAW`), not tiffs — don't filter the listing on `.tif`.
+Capture-produced `raw/` folders hold the MAPIR `.RAW`, the camera's own `.JPG`
+of the same shot, **and** the `.png` demosaiced from the RAW. Only the PNGs are
+sent to ODM (the session's `image_glob` is `*.png`); uploading both renders of a
+frame at zero baseline confuses the reconstruction, and the JPGs carry no GPS
+EXIF. Don't filter the listing on `.tif`.
 
 ### Two-phase flow
 
@@ -83,6 +87,59 @@ unstitched ──StartStitching──▶ stitching ──ODM done──▶ clust
 | `failed` | Terminal. See `error`. Reachable *after* a successful stitch too — both the asset download (`asset download failed: …`) and clustering (`clustering: stitched.tif missing`, `clustering failed: …`) fail the session. |
 | `canceled` | Terminal. Stitch was cancelled. |
 
+> A mapping mission that is still **flying** sits at `unstitched` the whole time:
+> `status` tracks the ODM pipeline only. Where the *flight* has got to is
+> `capture.state` — see below. Keeping them separate is deliberate, so a frontend
+> `switch` on `status` never has to know about flights.
+
+<a id="capture-block"></a>
+### `capture` block — flight state of a mapping mission
+
+Sessions produced by the drone carry an extra `capture` object (absent, or `{}`,
+for a client-created session). It is what makes a half-flown survey resumable, and
+it survives restarts along with the rest of `metadata.json`.
+
+```json
+"capture": {
+  "state": "paused",
+  "active": false,
+  "points": [{"lat": -7.2812, "lng": 112.7942}, {"lat": -7.2813, "lng": 112.7951}],
+  "captured": [0, 1, 2],
+  "pending": [],
+  "altitude": 20.0,
+  "hold_time": 2.0,
+  "final_action": "rtl",
+  "leg": 2,
+  "last_error": "",
+  "updated_at": "2026-09-12T21:40:11+07:00"
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `state` | Where the flight is: see the table below. |
+| `active` | The mapping monitor currently owns this folder. While true, `StartStitching`, `CancelJob` and `RemoveJob` refuse (see [Deleting](#deleting-a-mapping-session)). |
+| `points` | **Every** capture point of the original plan, in order. Indices into this list are what `captured`/`pending` refer to. |
+| `captured` | Point indices whose frames are on disk, paired with their geotag, **and** successfully turned into an ODM image. Only these count as done. |
+| `pending` | Point indices photographed but not yet secured. Promoted to `captured` when the leg is processed; a point stays here — and is **re-flown** on resume rather than leaving a hole in the coverage — if its leg failed, or if its own RAW could not be decoded (a truncated card write, or a camera resolution the unpacker doesn't expect). |
+| `altitude` / `hold_time` / `final_action` | The flight parameters, reused as defaults by `ResumeMappingMission`. |
+| `leg` | Which flight of this session is next (1 = the original push). |
+| `last_error` | Why the last leg failed, or empty. |
+
+| `capture.state` | Meaning |
+|-----------------|---------|
+| `armed` | Plan uploaded, monitor armed, `ExecuteMission` not yet called (or not yet airborne). |
+| `flying` | Captures in progress. |
+| `returning` | Last (or paused) capture done; the aircraft is flying home and landing. **Nothing is processed yet** — retrieving the frames puts the camera into USB mass-storage mode, which must not happen in flight. |
+| `processing` | Aircraft is down; frames are being pulled off the SD and georeferenced. |
+| `paused` | Leg processed, aircraft down, points still owed. Resumable. |
+| `done` | Every point captured; the session has been handed to ODM (`status` moves to `stitching`). |
+| `failed` | A leg could not be retrieved or paired — see `last_error`. Still resumable: its `pending` points get re-flown. |
+| `canceled` | Operator dropped the mission (`CancelMappingMission`). The frames and `captured` list survive. |
+| `interrupted` | The backend restarted while this session was armed/flying. Set by the boot sweep, since nothing is in the air under backend control any more. Resumable. |
+
+Resumable states are `paused`, `interrupted`, `armed` and `failed`.
+
 ### Session object
 
 Every endpoint returns the **session object** (the same shape as `metadata.json`,
@@ -107,10 +164,12 @@ plus absolute artifact paths and a `job_id` alias):
   "has_stitched": false,
   "has_clusters": false,
   "cluster_count": null,
+  "capture": {},
   "artifacts": {
     "raw_dir": "http://localhost:8000/sessions/<id>/raw/",
     "stitched_tif": "http://localhost:8000/sessions/<id>/stitched.tif",
-    "clusters_kml": "http://localhost:8000/sessions/<id>/clusters.kml"
+    "clusters_kml": "http://localhost:8000/sessions/<id>/clusters.kml",
+    "processed_dir": "http://localhost:8000/sessions/<id>/processed/"
   }
 }
 ```
@@ -131,7 +190,8 @@ plus absolute artifact paths and a `job_id` alias):
 | `error` | Failure reason, or empty. |
 | `has_stitched` / `has_clusters` | Whether `stitched.tif` / `clusters.kml` exist. |
 | `cluster_count` | Number of vegetation clusters (set by the clustering step). |
-| `artifacts` | **HTTP URLs** (served by the file server): `raw_dir`, and `stitched_tif` / `clusters_kml` (`null` until produced). See [Fetching artifacts](#fetching-artifacts). |
+| `capture` | Flight state for a drone-produced session; `{}` for a client-created one. See [the `capture` block](#capture-block). |
+| `artifacts` | **HTTP URLs** (served by the file server): `raw_dir`, and `stitched_tif` / `clusters_kml` / `processed_dir` (`null` until produced). See [Fetching artifacts](#fetching-artifacts). |
 
 ### Error codes
 
@@ -139,6 +199,7 @@ plus absolute artifact paths and a `job_id` alias):
 |-------------|------|
 | `INVALID_ARGUMENT` | Required field missing (`source_dir`, `session_id`), `source_dir` not found, or no images found in `raw/`. |
 | `NOT_FOUND` | No session with the given `session_id`. |
+| `FAILED_PRECONDITION` | The operation would disturb a mapping mission in progress, or delete frames that are the only copy — see [`RemoveJob`](#deleting-a-mapping-session). Retry with `force: true` once you mean it. |
 | `INTERNAL` | Unexpected failure creating a session or starting a stitch. |
 
 ---
@@ -254,9 +315,16 @@ Fetch one session, refreshing it against NodeODM if it is mid-stitch.
 
 ### `ListJobs`
 
-List all sessions, refreshing any in-flight stitches.
+List all sessions, refreshing any in-flight stitches. **This is the mapping-session
+list, and it includes a mission that is still flying** — a drone session is created
+when its mission is pushed, so it is here from takeoff on, with live progress in
+`capture` (`state`, `captured`, `points`).
 
-**Request:** `{}`
+**Request**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `capture_only` | bool | `false` | Return only sessions produced by the drone (those with a `capture` block). |
 
 **Response**
 
@@ -265,6 +333,14 @@ List all sessions, refreshing any in-flight stitches.
 ```
 
 > `jobs` duplicates `sessions` for back-compat; prefer `sessions`.
+
+To render one list of mapping missions with progress:
+
+```python
+for s in call("ListJobs", {"capture_only": True})["sessions"]:
+    c = s["capture"]
+    print(s["id"], c["state"], f'{len(c["captured"])}/{len(c["points"])} points', s["status"])
+```
 
 ---
 
@@ -277,25 +353,31 @@ Cancel a session's stitch on NodeODM and mark it `canceled`.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `session_id` | string | — | **Required.** (`job_id` accepted as an alias.) |
+| `force` | bool | `false` | Cancel even while a capture mission is flying this session. |
 
 ```json
 { "session_id": "20260612T092100_sawah-blok-utara" }
 ```
 
-**Response:** session object (`status: "canceled"`).
+**Response:** session object (`status: "canceled"`). `FAILED_PRECONDITION` while
+`capture.active` is true — cancel the *mission* first with
+`DroneService.CancelMappingMission`, which tears the monitor down cleanly.
 
 ---
 
+<a id="deleting-a-mapping-session"></a>
 ### `RemoveJob`
 
-Remove the NodeODM task **and delete the on-disk session folder** (raw images,
-orthophoto, KML, metadata — all of it).
+Delete a session: its NodeODM task **and its whole on-disk folder** (raw images,
+NDVI outputs, orthophoto, KML, metadata — all of it). This is the "delete" in
+list/pause/resume/delete.
 
 **Request**
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `session_id` | string | — | **Required.** (`job_id` accepted as an alias.) |
+| `force` | bool | `false` | Delete anyway (see the guard below). |
 
 ```json
 { "session_id": "20260612T092100_sawah-blok-utara" }
@@ -306,6 +388,62 @@ orthophoto, KML, metadata — all of it).
 ```json
 { "session_id": "20260612T092100_sawah-blok-utara", "job_id": "...", "removed": true }
 ```
+
+Returns `FAILED_PRECONDITION` without `force` when either:
+
+- `capture.active` is true — a mission is flying this session right now; or
+- `capture.captured` is non-empty — the session holds frames that, with
+  `CAPTURE_DRAIN_SD` on (the default), were **moved** off the camera SD. The
+  session folder is then the only copy. A half-flown session also *looks* empty in
+  a listing (`image_count` stays 0 until a stitch starts), which is exactly how it
+  gets deleted by accident.
+
+---
+
+## Managing a mapping mission
+
+A mapping mission is flown in one or more **legs**. `PushCaptureMission` starts leg
+1; `PauseMappingMission` ends the current leg early; `ResumeMappingMission` starts
+the next one. All three live on `soerogis.DroneService` (they need the flight
+controller) — see [drone_api.md](drone_api.md) for their request/response shapes.
+List and delete are the `MappingJobService` endpoints above, on the same
+`session_id`.
+
+```text
+PushCaptureMission  { capture_points: [...], altitude: 20 }   -> { session_id: "<sid>", ... }
+ExecuteMission      { mode: "mapping", job_id: "<sid>" }
+
+  ... flies, photographing each point ...
+
+PauseMappingMission { }               # battery low: come home, land, keep what we have
+  -> poll MappingMissionStatus until phase == "paused"
+  -> GetJob { session_id } shows capture.state "paused", captured [0..7] of 20
+
+  ... swap the battery, walk to a new takeoff spot ...
+
+ResumeMappingMission { session_id: "<sid>" }   # new plan for the 12 remaining points
+ExecuteMission       { mode: "mapping", job_id: "<sid>" }
+
+  ... flies the rest, returns to THIS leg's takeoff point, lands ...
+
+  -> capture.state "done", status "stitching"  (the ODM stitch starts itself)
+GetJob { session_id }                 # poll until status == "ready"
+```
+
+**Return and land before processing.** After the last capture point of a leg — and
+on pause — the aircraft advances to the plan's trailing `NAV_RETURN_TO_LAUNCH`,
+flies back to the takeoff point and lands. Only once touchdown is confirmed does
+the backend pull the frames off the camera: retrieval switches the camera into USB
+mass-storage mode and drains its SD card, which must not happen mid-flight. The
+takeoff point is the FCU's own HOME, recorded at arming — so a resumed leg returns
+to where *that* leg took off, not where the survey originally started.
+
+**Each leg is processed on landing.** A leg's frames are retrieved, demosaiced to
+PNG, NDVI-georeferenced into `processed/`, and merged into the session's `geo.txt`
+as soon as it lands. Frames accumulate in the one `raw/` folder across legs; only
+the final leg starts the stitch. That per-leg drain is also what keeps the geotag
+pairing honest — each leg pairs its own geotags against exactly the files that leg
+brought in.
 
 ---
 
