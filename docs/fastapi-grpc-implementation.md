@@ -178,6 +178,11 @@ POST /api/drone/land
 POST /api/drone/goto
 POST /api/drone/mission
 POST /api/drone/mission/execute
+POST /api/drone/mapping-mission
+GET  /api/drone/mapping-mission
+POST /api/drone/mapping-mission/pause
+POST /api/drone/mapping-mission/resume
+POST /api/drone/mapping-mission/cancel
 ```
 
 Mapping ke gRPC:
@@ -194,6 +199,16 @@ Mapping ke gRPC:
 | `POST /goto` | `/soerogis.DroneService/Goto` |
 | `POST /mission` | `/soerogis.DroneService/PushMission` |
 | `POST /mission/execute` | `/soerogis.DroneService/ExecuteMission` |
+| `POST /mapping-mission` | `/soerogis.DroneService/PushCaptureMission` |
+| `GET /mapping-mission` | `/soerogis.DroneService/MappingMissionStatus` |
+| `POST /mapping-mission/pause` | `/soerogis.DroneService/PauseMappingMission` |
+| `POST /mapping-mission/resume` | `/soerogis.DroneService/ResumeMappingMission` |
+| `POST /mapping-mission/cancel` | `/soerogis.DroneService/CancelMappingMission` |
+
+Route `mapping-mission/*` mengelola misi pemetaan per-leg (push → pause → resume,
+atau cancel). Body `resume` wajib `session_id`; `altitude`/`hold_time` opsional dan
+hanya diteruskan kalau ada. Kontrak lengkap (termasuk blok `capture` di sesi) ada
+di `docs/drone_api.md` bagian "Mapping capture mission" dan `docs/mapping.md`.
 
 Contoh route:
 
@@ -275,11 +290,18 @@ Mapping ke gRPC:
 
 | FastAPI | gRPC |
 | --- | --- |
-| `GET /api/jobs` | `/soerogis.MappingJobService/ListJobs` | response is a plain array for `fetchJobs()` |
+| `GET /api/jobs` | `/soerogis.MappingJobService/ListJobs` | response is a plain array for `fetchJobs()`; `?capture_only=true` diteruskan sebagai `{capture_only: true}` (hanya kalau true) |
 | `POST /api/jobs` | `/soerogis.MappingJobService/CreateOdmJob` |
 | `GET /api/jobs/{id}` | `/soerogis.MappingJobService/GetJob` |
-| `POST /api/jobs/{id}/cancel` | `/soerogis.MappingJobService/CancelJob` |
-| `DELETE /api/jobs/{id}` | `/soerogis.MappingJobService/RemoveJob` |
+| `POST /api/jobs/{id}/cancel` | `/soerogis.MappingJobService/CancelJob` | body JSON opsional `{force: true}` |
+| `DELETE /api/jobs/{id}` | `/soerogis.MappingJobService/RemoveJob` | `?force=true` diteruskan sebagai `{force: true}` |
+
+Sesi hasil misi drone sudah ada di `ListJobs` sejak misi di-push; status
+terbangnya ada di blok `capture` yang diteruskan apa adanya oleh
+`normalize_session` (hanya `artifacts` yang ditulis ulang, termasuk
+`processed_dir`). `CancelJob`/`RemoveJob` ditolak backend dengan
+`FAILED_PRECONDITION` → HTTP `409` saat `capture.active` (atau, untuk `RemoveJob`,
+saat `capture.captured` tidak kosong) kecuali `force`. Lihat `docs/mapping.md`.
 
 Contoh:
 

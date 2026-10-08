@@ -97,6 +97,9 @@ def reachable_artifact_url(url: str | None) -> str | None:
 
 
 def normalize_session(job: dict[str, Any]) -> dict[str, Any]:
+    # Only `artifacts` is rewritten (file-server URLs → a host the browser can
+    # reach); everything else — including the `capture` flight-state block of a
+    # drone-flown session — passes through untouched via **job.
     artifacts = job.get("artifacts")
     if not isinstance(artifacts, dict):
         return job
@@ -106,5 +109,6 @@ def normalize_session(job: dict[str, Any]) -> dict[str, Any]:
             "raw_dir": reachable_artifact_url(artifacts.get("raw_dir")) or artifacts.get("raw_dir"),
             "stitched_tif": reachable_artifact_url(artifacts.get("stitched_tif")),
             "clusters_kml": reachable_artifact_url(artifacts.get("clusters_kml")),
+            "processed_dir": reachable_artifact_url(artifacts.get("processed_dir")),
         },
     }

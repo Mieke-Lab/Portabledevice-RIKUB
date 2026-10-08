@@ -3,9 +3,18 @@ import { droneAddrHeaders } from "@/lib/gcs/drone-settings";
 async function jsonOrThrow(response) {
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(data?.error || data?.detail || `request failed (${response.status})`);
+    const err = new Error(data?.error || data?.detail || `request failed (${response.status})`);
+    err.status = response.status;
+    throw err;
   }
   return data;
+}
+
+// gRPC FAILED_PRECONDITION surfaces as HTTP 409 (grpc_backend.grpc_to_http_status):
+// the mapping backend uses it for "this would disturb a flying mission / delete the
+// only copy of captured frames" — retry with force once the operator confirms.
+export function isPreconditionError(err) {
+  return err?.status === 409;
 }
 
 export async function fetchDiagnostics() {
@@ -21,8 +30,11 @@ export async function fetchDroneConfig() {
   return jsonOrThrow(await fetch("/api/drone/config", { cache: "no-store" }));
 }
 
-export async function fetchJobs() {
-  return jsonOrThrow(await fetch("/api/jobs", { cache: "no-store" }));
+// List mapping sessions. A drone-flown survey is in here from takeoff on (with
+// its live `capture` block — docs/mapping.md); `captureOnly` keeps just those.
+export async function fetchJobs({ captureOnly } = {}) {
+  const query = captureOnly ? "?capture_only=true" : "";
+  return jsonOrThrow(await fetch(`/api/jobs${query}`, { cache: "no-store" }));
 }
 
 export async function fetchJob(id) {
@@ -38,12 +50,21 @@ export async function createJobFromFolder(sourceDir, opts = {}) {
   }));
 }
 
-export async function cancelJob(id) {
-  return jsonOrThrow(await fetch(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" }));
+// Cancel the ODM stitch. Refused (409) while a capture mission is flying the
+// session unless `force` — cancel the mission itself first (cancelMappingMission).
+export async function cancelJob(id, { force = false } = {}) {
+  return jsonOrThrow(await fetch(`/api/jobs/${encodeURIComponent(id)}/cancel`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(force ? { force: true } : {}),
+  }));
 }
 
-export async function removeJob(id) {
-  return jsonOrThrow(await fetch(`/api/jobs/${encodeURIComponent(id)}`, { method: "DELETE" }));
+// Delete the whole session folder. Refused (409) without `force` while a mission
+// is flying it, or when it holds captured frames that are the only copy.
+export async function removeJob(id, { force = false } = {}) {
+  const query = force ? "?force=true" : "";
+  return jsonOrThrow(await fetch(`/api/jobs/${encodeURIComponent(id)}${query}`, { method: "DELETE" }));
 }
 
 async function postCommand(path, body = {}) {
@@ -134,8 +155,10 @@ export async function pushCaptureMission(p) {
   );
 }
 
-// Read-only poll of the mapping capture mission. When `odm_job_id` is set the
-// backend has created the ODM session — resolve it via fetchJob(odm_job_id).
+// Read-only poll of the mapping capture mission. The session itself exists from
+// the moment the mission is pushed (its id is the `session_id` you passed), so the
+// persisted flight state lives in fetchJob(sessionId).capture — this is the live
+// per-leg view (`phase`, `captures_done`, `last_error`).
 export async function fetchMappingMissionStatus() {
   return jsonOrThrow(
     await fetch("/api/drone/mapping-mission", {
@@ -144,6 +167,35 @@ export async function fetchMappingMissionStatus() {
     }),
   );
 }
+
+// End the current leg early (PauseMappingMission): the aircraft returns to its
+// takeoff point, lands, and the frames taken so far are secured. Poll until the
+// session's capture.state is "paused" (or MappingMissionStatus.phase), then
+// resumeMappingMission() flies the remaining points as a new leg.
+export const pauseMappingMission = () => postCommand("/api/drone/mapping-mission/pause", {});
+
+// Start the next leg of a paused / interrupted / failed session
+// (ResumeMappingMission): uploads a plan for the points not yet captured, reusing
+// the session's altitude / hold_time unless overridden. Follow with
+// executeMission({ mode: "mapping", jobId: sessionId }) to fly it.
+export async function resumeMappingMission({ sessionId, altitude, holdTime } = {}) {
+  return jsonOrThrow(
+    await fetch("/api/drone/mapping-mission/resume", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...droneAddrHeaders() },
+      body: JSON.stringify({
+        session_id: sessionId,
+        ...(altitude != null && { altitude }),
+        ...(holdTime != null && { hold_time: holdTime }),
+      }),
+    }),
+  );
+}
+
+// Drop the capture mission (CancelMappingMission) and tear the monitor down
+// cleanly. The session, its frames and `capture.captured` survive on disk.
+export const cancelMappingMission = (sessionId) =>
+  postCommand("/api/drone/mapping-mission/cancel", sessionId ? { session_id: sessionId } : {});
 
 // --- Reactive spraying (see docs/drone_api.md → "Spraying pipeline") ---------
 

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { MapPinned, Bot, ScanSearch, ArrowRight, Layers, Image as ImageIcon, Cpu, LogOut, Wheat, Radar, Navigation, Map as MapIcon } from 'lucide-react';
+import { MapPinned, Bot, ScanSearch, ArrowRight, Layers, Image as ImageIcon, LogOut, Wheat, Radar, Map as MapIcon } from 'lucide-react';
 import { Card } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -84,27 +84,19 @@ const CARDS = [
   },
   {
     to: '/mapping', accent: 'uplift', Icon: MapIcon, tag: 'Fotogrametri',
-    coverGradient: 'from-forest to-uplift', title: 'Pemetaan Lahan', subtitle: 'Orthophoto & Zona', online: true,
-    desc: 'Jahit gambar drone menjadi orthophoto & deteksi zona lahan otomatis.',
-    stats: [{ Icon: Layers, label: 'zona lahan' }, { Icon: ImageIcon, label: 'orthophoto' }],
+    coverGradient: 'from-forest to-uplift', title: 'Pemetaan Lahan', online: true,
   },
   {
     to: '/monitoring', accent: 'monitor', Icon: Radar, tag: 'Telemetry Live',
-    cover: '/data/cover/gis.jpg', objPos: '50% 55%', title: 'Monitoring Drone', subtitle: 'Pemantauan Misi', online: true,
-    desc: 'Pantau posisi drone, jalur misi & area penyemprotan secara real-time.',
-    stats: [{ Icon: Navigation, label: 'live tracking' }],
+    cover: '/data/cover/gis.jpg', objPos: '50% 55%', title: 'Monitoring Drone', online: true,
   },
   {
     to: '/chatbot', accent: 'leaf', Icon: Bot, tag: 'Asisten AI',
-    cover: '/data/cover/chatbot.jpg', objPos: '72% 26%', title: 'Chatbot AI', subtitle: 'Asisten Cerdas', online: true,
-    desc: 'Konsultasi pertanian & analisis parameter sawah.',
-    stats: [{ Icon: Cpu, label: 'model aktif' }],
+    cover: '/data/cover/chatbot.jpg', objPos: '72% 26%', title: 'Chatbot AI', online: true,
   },
   {
     to: '/detection', accent: 'harvest', Icon: ScanSearch, tag: 'Computer Vision',
-    cover: '/data/cover/detection.jpg', objPos: '50% 45%', title: 'Deteksi Penyakit', subtitle: 'Klasifikasi Penyakit Daun', online: true,
-    desc: 'Identifikasi penyakit padi dari citra daun.',
-    stats: [{ Icon: ScanSearch, label: 'terakhir: —' }],
+    cover: '/data/cover/detection.jpg', objPos: '50% 45%', title: 'Deteksi Penyakit', online: true,
   },
 ];
 
@@ -168,7 +160,7 @@ function FeatureCard({ card }) {
     );
   }
 
-  // --- DESAIN NORMAL (Chatbot, Deteksi, persis seperti aslinya) ---
+  // --- DESAIN NORMAL (Pemetaan, Monitoring, Chatbot, Deteksi): cover + title only ---
   return (
     <Card
       role="button"
@@ -187,31 +179,19 @@ function FeatureCard({ card }) {
             <Icon className="h-14 w-14 text-white/85" strokeWidth={1.3} />
           </div>
         )}
-        <Badge variant="outline" className="absolute right-3 top-3 border-transparent bg-white/90 uppercase tracking-wide backdrop-blur-sm">{card.tag}</Badge>
+        {/* No tag badge here: at kiosk width (~180px per card) it collided with
+            the online pill and covered the picture. */}
         <span className={`absolute left-3 top-3 inline-flex items-center gap-1.5 rounded-full bg-white/90 px-2.5 py-1 text-xs font-semibold backdrop-blur-sm ${card.online ? 'text-leaf' : 'text-slate-500'}`}>
           <span className={`h-2 w-2 rounded-full ${card.online ? 'bg-leaf' : 'bg-slate-300'}`} />
           {card.online ? 'online' : 'offline'}
         </span>
       </div>
 
-      <div className="flex shrink-0 flex-col gap-2 p-4">
-        <div className="flex items-center gap-2">
-          <span className={`grid h-9 w-9 place-items-center rounded-xl ${a.chip}`}><Icon className="h-5 w-5" strokeWidth={1.9} /></span>
-          <div>
-            <h2 className="font-bold leading-none text-forest text-xl">{card.title}</h2>
-            <p className={`mt-1 text-sm font-semibold ${a.text}`}>{card.subtitle}</p>
-          </div>
-        </div>
-        <p className="text-muted-foreground line-clamp-2 text-sm leading-snug">{card.desc}</p>
-
-        <div className="mt-auto flex items-center justify-between border-t border-border/70 pt-3">
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs font-medium text-muted-foreground">
-            {card.stats.map((s, i) => <span key={i} className="inline-flex items-center gap-1.5"><s.Icon className="h-3.5 w-3.5" /> {s.label}</span>)}
-          </div>
-          <span className={`inline-flex items-center gap-1.5 text-sm font-bold ${a.text}`}>
-            Buka <ArrowRight className="h-4 w-4 transition-transform duration-200 group-hover:translate-x-1" />
-          </span>
-        </div>
+      {/* Title strip only — the kiosk screen is small, so the cover picture gets
+          the height; subtitle/description/stats would push it out of view. */}
+      <div className="flex shrink-0 items-center gap-2.5 px-4 py-3">
+        <span className={`grid h-9 w-9 shrink-0 place-items-center rounded-xl ${a.chip}`}><Icon className="h-5 w-5" strokeWidth={1.9} /></span>
+        <h2 className="line-clamp-2 text-base font-bold leading-tight text-forest">{card.title}</h2>
       </div>
     </Card>
   );
