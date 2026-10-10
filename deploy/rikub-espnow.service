@@ -1,0 +1,18 @@
+# System service (root: monitor mode + raw socket). Install:
+#   sudo cp deploy/rikub-espnow.service /etc/systemd/system/ && sudo systemctl enable --now rikub-espnow
+[Unit]
+Description=Jaga Padi: 7-in-1 soil sensor via ESP-NOW (monitor dongle -> /run/rikub-espnow/tty)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/pi/rikub-project/deploy/espnow_bridge.py
+RuntimeDirectory=rikub-espnow
+RuntimeDirectoryMode=0755
+Restart=always
+RestartSec=5
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

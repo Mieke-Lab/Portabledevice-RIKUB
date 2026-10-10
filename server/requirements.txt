@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+SQLAlchemy
+psycopg[binary]
+python-dotenv
+rasterio
+numpy
+pillow
+matplotlib
+shapely
+pyproj
+grpcio
+httpx
+opencv-python-headless
+pyserial
+python-multipart

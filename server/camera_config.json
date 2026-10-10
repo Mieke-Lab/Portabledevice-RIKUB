@@ -1,0 +1,67 @@
+{
+  "_comment": "Single config for the 'Siang Terik Sawah' camera preset (webcam UVC /dev/video0). Every range and threshold lives here. Edits apply on the next API request - no restart needed.",
+
+  "device": "/dev/video0",
+  "preset_file": "storage/camera/preset_siang_terik.json",
+
+  "exposure": {
+    "_comment": "The webcam has no EV control. EV is emulated as manual exposure: exposure_time_absolute = reference_units * 2^EV (1 unit = 100 us). With reference 312 (31.2 ms, the driver default) EV -2..0 maps to 78..312 = the driver minimum (7.8 ms) .. default.",
+    "ev_min": -2.0,
+    "ev_max": 0.0,
+    "ev_step": 0.1,
+    "ev_default": -1.3,
+    "reference_units": 312
+  },
+
+  "white_balance": {
+    "_comment": "Replaces ColourGains R/B (not supported by this webcam): fixed white balance in Kelvin, AWB off. ~5500 K = midday sun.",
+    "min": 2800,
+    "max": 6500,
+    "step": 50,
+    "default": 5500
+  },
+
+  "focus": {
+    "_comment": "Replaces LensPosition in dioptres: the webcam exposes focus_absolute in unitless steps 0..15 (continuous AF off while set).",
+    "min": 0,
+    "max": 15,
+    "step": 1,
+    "default": 0
+  },
+
+  "preview": {
+    "_comment": "Live MJPEG preview rate. The webcam delivers 30 fps; 20 keeps CPU/power low and fits slower links (Tailscale relay). Lower it for slow networks.",
+    "fps": 20
+  },
+
+  "analysis": {
+    "_comment": "Indicators are computed on the live preview frame downscaled to width_px, at most once per interval_s.",
+    "width_px": 480,
+    "interval_s": 0.5
+  },
+
+  "leaf_mask": {
+    "_comment": "OpenCV HSV (H 0-179, S/V 0-255). A pixel is 'leaf' if it falls in ANY enabled range. Enable kuning/coklat for diseased leaves. A blown-out leaf pixel turns white (no saturation) and falls outside every colour range, so each blob of clipped pixels is judged by its surroundings: if at least clip_enclosed_ratio of a clip_ring_px ring around it is leaf, the whole blob counts as clipped leaf.",
+    "ranges": [
+      {"name": "hijau",  "enabled": true,  "lower": [35, 40, 40],  "upper": [85, 255, 255]},
+      {"name": "kuning", "enabled": false, "lower": [20, 60, 60],  "upper": [34, 255, 255]},
+      {"name": "coklat", "enabled": false, "lower": [5, 60, 30],   "upper": [19, 255, 200]}
+    ],
+    "morph_open_px": 3,
+    "clip_ring_px": 3,
+    "clip_enclosed_ratio": 0.5,
+    "min_leaf_percent": 2.0
+  },
+
+  "quality": {
+    "_comment": "clip_level: a pixel counts as clipped if any channel >= this. sharpness_min is a starting guess (Laplacian variance at analysis.width_px) - calibrate it in the field.",
+    "clip_level": 250,
+    "clip_max_percent": 1.0,
+    "sharpness_min": 80.0
+  },
+
+  "thermal": {
+    "pause_above_c": 75.0,
+    "resume_below_c": 70.0
+  }
+}

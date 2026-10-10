@@ -1,0 +1,7 @@
+[Unit]
+Description=Jaga Padi: regenerate HTTPS cert if the Pi's IP changed
+
+[Service]
+Type=oneshot
+ExecStart=/home/pi/rikub-project/watch-cert.sh
+Nice=15

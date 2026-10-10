@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Jaga Padi
+Comment=Smart Rice Field Monitoring
+Exec=/home/pi/rikub-project/deploy/jaga-padi-launch.sh
+Icon=/home/pi/rikub-project/web/public/favicon.svg
+Terminal=false
+Categories=Utility;

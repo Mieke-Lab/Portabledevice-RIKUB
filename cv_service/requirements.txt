@@ -1,0 +1,4 @@
+# CV inference microservice deps (installed into /home/pi/venv_yolo alongside the
+# model's own deps: ultralytics, torch, torchvision, opencv-python, numpy).
+fastapi
+uvicorn

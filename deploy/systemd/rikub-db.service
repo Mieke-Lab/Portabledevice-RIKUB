@@ -1,0 +1,28 @@
+[Unit]
+Description=Jaga Padi PostgreSQL (project cluster, 127.0.0.1:5433)
+PartOf=rikub.target
+
+[Service]
+# postgres is built with sd_notify: the unit only turns "active" once the server
+# accepts connections, so the backend never starts against a half-up database.
+Type=notify
+# Let boot's own current peak (desktop, WiFi, USB enumeration) pass before we add
+# load: wait until the Pi has been up 45 s. Later (re)starts don't wait.
+ExecStartPre=/bin/sh -c 'u=$(cut -d. -f1 /proc/uptime); [ "$u" -ge 45 ] || sleep $((45 - u))'
+# A power cut leaves postmaster.pid behind; clear it if its PID was reused.
+ExecStartPre=/home/pi/rikub-project/deploy/pg-clear-stale-pid.sh
+ExecStart=/usr/lib/postgresql/15/bin/postgres -D /home/pi/rikub-project/pgdata \
+  -p 5433 -c listen_addresses=127.0.0.1 -c unix_socket_directories=%t/rikub-pg
+RuntimeDirectory=rikub-pg
+# SIGINT = "fast" shutdown: clean checkpoint, no waiting on idle clients.
+KillSignal=SIGINT
+KillMode=mixed
+# Crash recovery after a brownout can take a while - don't kill it mid-replay.
+TimeoutStartSec=300
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=5
+IOWeight=200
+
+[Install]
+WantedBy=rikub.target

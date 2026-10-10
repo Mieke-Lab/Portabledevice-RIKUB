@@ -1,7 +1,0 @@
-# Jaga Padi pywebview shell (Pi 5)
-pywebview>=5.3
-Flask>=3.0
-# Pi 5 (Raspberry Pi OS) also needs system WebKitGTK + GObject bindings:
-#   sudo apt install -y python3-gi python3-gi-cairo gir1.2-gtk-3.0 \
-#                       gir1.2-webkit2-4.1 libcairo2-dev
-# Windows dev uses EdgeChromium WebView2 (no extra apt).
