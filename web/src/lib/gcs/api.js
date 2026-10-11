@@ -67,6 +67,25 @@ export async function removeJob(id, { force = false } = {}) {
   return jsonOrThrow(await fetch(`/api/jobs/${encodeURIComponent(id)}${query}`, { method: "DELETE" }));
 }
 
+// Copy a finished session's orthophoto + NDVI into THIS system (field imagery: what the
+// spraying and Maps features read). Fire-and-poll: start it, then fetchJobImport until
+// `state` is done | failed. Running it again refreshes the imagery already imported.
+// The artifact URLs on the job point at the mapping backend's plain-HTTP file server,
+// which an HTTPS page cannot fetch — the server does the download itself.
+export async function startJobImport(id, { fieldName } = {}) {
+  return jsonOrThrow(await fetch(`/api/jobs/${encodeURIComponent(id)}/import`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(fieldName ? { field_name: fieldName } : {}),
+  }));
+}
+
+// { state: "none" | "running" | "done" | "failed", progress, message, error,
+//   imagery, field, files: { rgb_tif, ndvi_tif, zones_kml } }
+export async function fetchJobImport(id) {
+  return jsonOrThrow(await fetch(`/api/jobs/${encodeURIComponent(id)}/import`, { cache: "no-store" }));
+}
+
 async function postCommand(path, body = {}) {
   return jsonOrThrow(
     await fetch(path, {

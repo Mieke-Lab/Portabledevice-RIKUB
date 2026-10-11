@@ -1,8 +1,11 @@
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
+from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
+from app import map_import
+from app.db.database import get_db
 from app.grpc_backend import call_grpc, normalize_session
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
@@ -53,6 +56,35 @@ async def create_job(request: Request):
 @router.get("/{session_id}")
 def get_job(session_id: str):
     return normalize_session(call_grpc(f"{JOBS}/GetJob", {"session_id": session_id}, timeout=30))
+
+
+@router.post("/{session_id}/import", status_code=202)
+async def import_job_map(session_id: str, request: Request):
+    """Copy a finished session's orthophoto + NDVI into this system (fire-and-poll).
+
+    Downloads `stitched.tif` / `ndvi.tif` from the mapping backend's file server,
+    shapes them like the DJI maps (`storage/imagery/<lahan>/<capture>/{rgb,ndvi}.tif`)
+    and registers them as field imagery — what the spraying and Maps features read.
+    Optional JSON body `{field_name}` (default: the session's area_name, then name).
+    Importing a session again refreshes its imagery. Poll `GET .../import`."""
+    if not map_import.SESSION_ID_RE.match(session_id):
+        raise HTTPException(status_code=400, detail="ID sesi tidak valid")
+    body = await _read_json(request)
+    field_name = body.get("field_name")
+    if field_name is not None and not isinstance(field_name, str):
+        raise HTTPException(status_code=400, detail="field_name harus berupa teks")
+    session = await run_in_threadpool(call_grpc, f"{JOBS}/GetJob", {"session_id": session_id}, 30)
+    plan = map_import.plan_import(normalize_session(session), field_name)
+    return map_import.REGISTRY.start(plan)
+
+
+@router.get("/{session_id}/import")
+def get_job_import(session_id: str, db: Session = Depends(get_db)):
+    """Import status: running | done | failed | none (never imported)."""
+    state = map_import.REGISTRY.get(session_id)
+    if state is not None:
+        return state
+    return map_import.find_import(session_id, db) or {"state": "none", "session_id": session_id}
 
 
 @router.post("/{session_id}/cancel")

@@ -217,7 +217,7 @@ def test_normalize_session_keeps_processed_dir_and_capture_block():
 
     assert out["capture"] == SESSION["capture"]
     assert out["capture"] is SESSION["capture"]  # passed through, not rebuilt
-    assert set(out["artifacts"]) == {"raw_dir", "stitched_tif", "clusters_kml", "processed_dir"}
+    assert set(out["artifacts"]) == {"raw_dir", "stitched_tif", "clusters_kml", "ndvi_tif", "processed_dir"}
     assert out["artifacts"]["processed_dir"] == SESSION["artifacts"]["processed_dir"]
     assert out["artifacts"]["stitched_tif"] is None
     assert out["artifacts"]["clusters_kml"] is None

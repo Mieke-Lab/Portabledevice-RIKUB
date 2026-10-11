@@ -777,6 +777,46 @@ def create_imagery_for_field(
     return imagery
 
 
+def upsert_imagery_for_field(
+    field: Field,
+    payload: ImageryRegister,
+    db: Session,
+) -> tuple[FieldImagery, bool]:
+    """Register imagery, or REFRESH the row already registered for the same RGB file.
+
+    Used by the mapping import (app/map_import.py): importing one mapping session twice
+    must update its imagery (new PNGs, corners, NDVI stats), not stack a duplicate that
+    the Maps page would list as a second capture. The row id is kept, so spray zones
+    already approved against it stay attached. Returns (imagery, created).
+    """
+    existing = (
+        db.query(FieldImagery)
+        .filter(
+            FieldImagery.field_id == field.id,
+            FieldImagery.rgb_tif_path == payload.rgb_tif_path,
+        )
+        .first()
+    )
+    if existing is None:
+        return create_imagery_for_field(field, payload, db), True
+
+    ensure_existing_file(payload.rgb_tif_path)
+    ensure_existing_file(payload.ndvi_tif_path)
+    corners = read_geotiff_corners(payload.rgb_tif_path) or {}
+    existing.capture_at = payload.capture_at
+    existing.ndvi_tif_path = payload.ndvi_tif_path
+    existing.rgb_png_path = convert_rgb_tif_to_png(payload.rgb_tif_path)
+    existing.ndvi_png_path = convert_ndvi_tif_to_png(payload.ndvi_tif_path)
+    existing.top_left = corners.get("top_left")
+    existing.top_right = corners.get("top_right")
+    existing.bottom_left = corners.get("bottom_left")
+    existing.bottom_right = corners.get("bottom_right")
+    existing.ndvi_stats = compute_ndvi_stats(payload.ndvi_tif_path)
+    db.commit()
+    db.refresh(existing)
+    return existing, False
+
+
 @router.get("")
 def list_fields(db: Session = Depends(get_db)) -> list[dict]:
     fields = db.query(Field).order_by(desc(Field.created_at)).all()

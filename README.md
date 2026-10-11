@@ -121,6 +121,30 @@ Kalau datanya masih foto mentah drone (belum di-stitch jadi orthophoto),
 proses dulu lewat Mapping (`/drone-dashboard/mapping`) sebelum didaftarkan ke
 `/imagery/register`.
 
+### Mengambil peta langsung dari backend mapping (Soerogis)
+
+Hasil mapping drone tidak perlu disalin manual. Di halaman sesi pemetaan
+(`/mapping/<id>`), tombol **Unduh Peta ke Sistem** meminta server ini mengambil
+`stitched.tif` + `ndvi.tif` (+ `clusters.kml`) dari file server backend mapping,
+lalu mendaftarkannya sebagai imagery lahan seperti peta DJI.
+
+```bash
+curl -X POST http://localhost:8000/api/jobs/<session_id>/import \
+  -H "Content-Type: application/json" -d '{"field_name": "Sawah Blok A"}'   # body opsional
+curl http://localhost:8000/api/jobs/<session_id>/import                      # status: none|running|done|failed
+```
+
+- Kode: `server/app/map_import.py` (+ route di `routes/jobs.py`, `upsert_imagery_for_field` di `routes/fields.py`).
+- File disimpan di `storage/imagery/<lahan>/capture-<tanggal>-<id-sesi>/` sebagai
+  `rgb.tif` (3 band **R, G, NIR** uint8, nodata 0 -- kamera RGN tidak punya band biru),
+  `ndvi.tif` (float32, nodata -9999), `zones.kml`, dan `source.json`.
+- Mengunduh ulang sesi yang sama **memperbarui** imagery (id tetap), bukan membuat duplikat.
+- Server mengunduh sendiri (server-ke-server), karena halaman HTTPS tidak boleh mengambil
+  file dari file server HTTP backend mapping (mixed content).
+- Alamat backend mapping dibaca dari `BACKEND_GRPC_ADDR` di `server/.env`.
+- Setelah `git pull` yang mengubah model, jalankan `python scripts/create_tables.py`
+  (idempoten) sebelum restart `rikub-backend`.
+
 ### Yang terjadi di balik layar saat endpoint di-hit
 
 Handler: `register_imagery_with_field` di `server/app/routes/fields.py:646`.

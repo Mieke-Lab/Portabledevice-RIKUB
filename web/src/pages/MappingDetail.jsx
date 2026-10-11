@@ -12,7 +12,7 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import {
   fetchJob, cancelJob, removeJob, isPreconditionError,
-  pauseMappingMission, cancelMappingMission,
+  pauseMappingMission, cancelMappingMission, startJobImport, fetchJobImport,
 } from "@/lib/gcs/api";
 import {
   captureOf, captureProgress, captureStateMeta, capturePointsForDisplay,
@@ -20,7 +20,6 @@ import {
 } from "@/lib/gcs/mapping-capture";
 import { useDroneOffset } from "@/lib/gcs/drone-offset";
 import { parseKml } from "@/lib/gcs/kml";
-import { decodeOrthoPreview } from "@/lib/gcs/ortho";
 import { fetchBlobWithProgress } from "@/lib/gcs/fetch-progress";
 import { BASE_LAYERS } from "@/components/maps/mapConfig";
 import { DEFAULT_CENTER, DEFAULT_ZOOM } from "@/lib/gcs/basemap";
@@ -163,7 +162,7 @@ export function MappingDetail() {
   const mapDiv = useRef(null);
   const map = useRef(null);
   const zonesLayer = useRef(null);
-  const orthoOverlay = useRef(null);
+  const importOverlay = useRef(null);
   const captureLayer = useRef(null);
   // Which layer last fitted the view ("capture" | "zones" | "ortho"). The capture
   // plan only fits once and never over a view the real products already framed.
@@ -182,11 +181,14 @@ export function MappingDetail() {
   const [zones, setZones] = useState([]);
   const [kmlProgress, setKmlProgress] = useState(null);
   const [kmlError, setKmlError] = useState(null);
-  const [tifProgress, setTifProgress] = useState(null);
-  const [tifError, setTifError] = useState(null);
-  const [orthoProjected, setOrthoProjected] = useState(false);
 
-  const [downloading, setDownloading] = useState(null);
+  // Import of the finished map into this system (field imagery) — see startJobImport.
+  const [imp, setImp] = useState(null);
+  const [impError, setImpError] = useState(null);
+  const [impEpoch, setImpEpoch] = useState(0);
+  const [fieldName, setFieldName] = useState("");
+  const [layerMode, setLayerMode] = useState("rgb"); // "rgb" | "ndvi" | "off"
+
   const [cancelling, setCancelling] = useState(false);
   // null | "delete" | "delete-force" | "delete-blocked" | "pause" | "cancel-mission" | "cancel-stitch"
   const [modal, setModal] = useState(null);
@@ -197,8 +199,14 @@ export function MappingDetail() {
   // returning/processing/paused — no effect needed.
   const [pausedLeg, setPausedLeg] = useState(null);
 
-  const kmlUrl = job?.artifacts?.clusters_kml || null;
-  const tifUrl = job?.artifacts?.stitched_tif || null;
+  // `job.artifacts` URLs point at the mapping backend's plain-HTTP file server: this
+  // HTTPS page cannot fetch them (mixed content), and they hold UTM rasters the
+  // Leaflet basemap cannot place anyway. So the page works from the copy that the
+  // import makes in THIS system: PNG overlays + WGS84 corners + the zone KML.
+  const imported = imp?.state === "done" ? imp : null;
+  const importing = imp?.state === "running";
+  const importable = job?.status === "ready" && !!job?.artifacts?.stitched_tif && !!job?.artifacts?.ndvi_tif;
+  const kmlUrl = imported?.files?.zones_kml || null;
   const status = job?.status;
   const busy = BUSY.has(status);
   const stitchBusy = status === "stitching" || status === "clustering";
@@ -252,7 +260,7 @@ export function MappingDetail() {
       m.remove();
       map.current = null;
       zonesLayer.current = null;
-      orthoOverlay.current = null;
+      importOverlay.current = null;
       captureLayer.current = null;
       viewFit.current = null;
       setMapReady(false);
@@ -349,55 +357,54 @@ export function MappingDetail() {
     return () => { alive = false; controller.abort(); };
   }, [kmlUrl, mapReady, id]);
 
-  // --- Decode + overlay the orthophoto (true-colour GeoTIFF) once it exists -----
+  // --- Import status: has this map already been copied into the system? --------
   useEffect(() => {
-    if (!tifUrl || !mapReady) return;
+    if (!id || job?.status !== "ready") return;
     let alive = true;
-    const controller = new AbortController();
-    setTifProgress(0);
-    setTifError(null);
-    setOrthoProjected(false);
-    (async () => {
+    let timer;
+    async function tick() {
       try {
-        const blob = await fetchBlobWithProgress(
-          tifUrl,
-          (l, t) => { if (alive && t) setTifProgress(Math.min(90, (l / t) * 90)); },
-          controller.signal,
-        );
-        const buf = await blob.arrayBuffer();
+        const st = await fetchJobImport(id);
         if (!alive) return;
-        setTifProgress(94);
-        const result = await decodeOrthoPreview(buf);
-        if (!alive) return;
-        if (result.geographic && result.dataUrl) {
-          const [minLng, minLat, maxLng, maxLat] = result.bbox;
-          const bounds = [[minLat, minLng], [maxLat, maxLng]];
-          if (orthoOverlay.current) orthoOverlay.current.remove();
-          const overlay = L.imageOverlay(result.dataUrl, bounds, { opacity: 0.9, interactive: false });
-          overlay.addTo(map.current);
-          orthoOverlay.current = overlay;
-          zonesLayer.current?.bringToFront();
-          if (!zonesLayer.current) {
-            try {
-              map.current.fitBounds(bounds, { padding: [40, 40] });
-              viewFit.current = "ortho";
-            } catch { /* empty */ }
-          }
-        } else {
-          // Projected CRS (e.g. UTM) — can't place on the lat/lng basemap without
-          // reprojection. Zones still render; the full raster is downloadable.
-          setOrthoProjected(true);
-        }
-        setTifProgress(100);
+        setImp(st);
+        setImpError(null);
+        if (st.state === "running") timer = setTimeout(tick, 1500);
       } catch (e) {
-        if (alive && e?.name !== "AbortError") {
-          setTifProgress(null);
-          setTifError(e instanceof Error ? e.message : "Gagal memuat orthophoto");
-        }
+        // The status route needs the database — say so instead of pretending
+        // nothing was imported.
+        if (alive) setImpError(e instanceof Error ? e.message : "Status unduhan tidak bisa dibaca");
       }
-    })();
-    return () => { alive = false; controller.abort(); };
-  }, [tifUrl, mapReady]);
+    }
+    tick();
+    return () => { alive = false; clearTimeout(timer); };
+  }, [id, job?.status, impEpoch]);
+
+  // --- Overlay the imported imagery: PNG + WGS84 corners (as the Maps page does) --
+  const imageryStamp = imported?.finished_at ?? imported?.imported_at ?? "";
+  useEffect(() => {
+    if (!mapReady || !map.current) return;
+    importOverlay.current?.remove();
+    importOverlay.current = null;
+    const imagery = imported?.imagery;
+    const url = layerMode === "rgb" ? imagery?.rgb_png_path : layerMode === "ndvi" ? imagery?.ndvi_png_path : null;
+    const corners = [imagery?.top_left, imagery?.top_right, imagery?.bottom_left, imagery?.bottom_right].filter(Boolean);
+    if (!url || corners.length < 2) return;
+    const lats = corners.map((c) => c.lat);
+    const lngs = corners.map((c) => c.lng);
+    const bounds = [[Math.min(...lats), Math.min(...lngs)], [Math.max(...lats), Math.max(...lngs)]];
+    // ?v= so a refreshed import (same file name) is not served from the browser cache.
+    const overlay = L.imageOverlay(`${url}?v=${encodeURIComponent(imageryStamp)}`, bounds, { opacity: 0.85, interactive: false });
+    overlay.addTo(map.current);
+    importOverlay.current = overlay;
+    zonesLayer.current?.bringToFront();
+    if (!zonesLayer.current) {
+      try {
+        map.current.fitBounds(bounds, { padding: [40, 40] });
+        viewFit.current = "ortho";
+      } catch { /* empty */ }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on the imagery + stamp, not the poll's fresh `imp` object
+  }, [mapReady, imported?.imagery?.id, imported?.imagery?.rgb_png_path, imported?.imagery?.ndvi_png_path, imageryStamp, layerMode]);
 
   // --- Capture plan overlay (drone-flown sessions): the survey path plus one dot
   //     per point coloured by what the backend has secured. Redrawn only when the
@@ -444,26 +451,26 @@ export function MappingDetail() {
     }, ms));
   }
 
-  async function download(url, filename, key) {
-    setDownloading(key);
-    setError(null);
+  async function handleImport() {
+    setImpError(null);
     try {
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const blob = await res.blob();
-      const objUrl = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = objUrl;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(objUrl), 15000);
+      const started = await startJobImport(id, { fieldName: fieldName.trim() || undefined });
+      setImp(started);
+      setImpEpoch((n) => n + 1); // restart the status poll
     } catch (e) {
-      setError(`Gagal mengunduh: ${e instanceof Error ? e.message : e}`);
-    } finally {
-      setDownloading(null);
+      setImpError(e instanceof Error ? e.message : "Gagal memulai unduhan");
     }
+  }
+
+  // This system's own copy (same origin) -> save dialog. A plain download link rather
+  // than fetch()+blob: the rasters are tens of MB.
+  function saveFile(url, filename) {
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
   }
 
   async function handleCancel() {
@@ -613,12 +620,27 @@ export function MappingDetail() {
           {(kmlProgress !== null && kmlProgress < 100) && (
             <div className="border-t border-border p-3"><ProgressBar pct={kmlProgress} label="Memuat zona lahan…" /></div>
           )}
-          {(tifProgress !== null && tifProgress < 100) && (
-            <div className="border-t border-border p-3"><ProgressBar pct={tifProgress} label="Membaca orthophoto…" /></div>
+          {importing && (
+            <div className="border-t border-border p-3"><ProgressBar pct={imp.progress ?? 0} label={imp.message || "Mengunduh peta…"} /></div>
           )}
-          {orthoProjected && (
+          {imported && (
+            <div className="flex flex-wrap items-center gap-2 border-t border-border px-3 py-2 text-xs text-muted-foreground">
+              <span className="font-semibold text-foreground/80">Lapisan</span>
+              {[["rgb", "Orthophoto (R+G+NIR)"], ["ndvi", "NDVI"], ["off", "Sembunyikan"]].map(([mode, label]) => (
+                <button
+                  key={mode}
+                  type="button"
+                  onClick={() => setLayerMode(mode)}
+                  className={`rounded-full border px-2.5 py-1 font-semibold transition ${layerMode === mode ? "border-forest bg-forest text-white" : "border-border hover:bg-muted"}`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          )}
+          {!imported && !importing && importable && (
             <div className="flex items-center gap-2 border-t border-border px-3 py-2 text-xs text-muted-foreground">
-              <AlertTriangle className="h-3.5 w-3.5 shrink-0" /> Orthophoto dalam proyeksi terproyeksi (mis. UTM) — pratinjau raster butuh reproyeksi; zona tetap tampil & orthophoto penuh dapat diunduh.
+              <AlertTriangle className="h-3.5 w-3.5 shrink-0" /> Orthophoto &amp; NDVI masih di backend mapping. Tekan “Unduh Peta ke Sistem” agar overlay, zona, dan fitur Spraying bisa memakainya.
             </div>
           )}
           {kmlError && (
@@ -626,9 +648,9 @@ export function MappingDetail() {
               <AlertTriangle className="h-3.5 w-3.5 shrink-0" /> Gagal memuat zona: {kmlError}
             </div>
           )}
-          {tifError && (
+          {(impError || imp?.state === "failed") && (
             <div className="flex items-center gap-2 border-t border-border px-3 py-2 text-xs text-destructive">
-              <AlertTriangle className="h-3.5 w-3.5 shrink-0" /> Gagal memuat orthophoto: {tifError}
+              <AlertTriangle className="h-3.5 w-3.5 shrink-0" /> Gagal mengunduh peta: {impError || imp.error}
             </div>
           )}
         </Card>
@@ -717,15 +739,46 @@ export function MappingDetail() {
 
               <Card className="flex flex-col gap-2.5 p-5">
                 <h3 className="mb-1 font-bold text-forest">Aksi</h3>
-                {tifUrl && (
-                  <Button variant="outline" onClick={() => download(tifUrl, `${id}-orthophoto.tif`, "tif")} disabled={downloading === "tif"}>
-                    {downloading === "tif" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />} Unduh Orthophoto
-                  </Button>
+                {importable && (
+                  <div className="flex flex-col gap-2 rounded-xl border border-border/70 p-3">
+                    <label htmlFor="import-field-name" className="text-xs font-semibold text-muted-foreground">Nama lahan</label>
+                    <input
+                      id="import-field-name"
+                      value={fieldName}
+                      onChange={(e) => setFieldName(e.target.value)}
+                      placeholder={job.area_name || job.name || id}
+                      disabled={importing}
+                      maxLength={120}
+                      className="h-9 rounded-lg border border-border bg-background px-3 text-sm outline-none focus:border-leaf disabled:opacity-60"
+                    />
+                    <Button variant="accent" onClick={handleImport} disabled={importing}>
+                      {importing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+                      {importing ? "Mengunduh…" : imported ? "Perbarui Peta di Sistem" : "Unduh Peta ke Sistem"}
+                    </Button>
+                    <p className="text-[11px] leading-snug text-muted-foreground">
+                      {imported
+                        ? <>Tersimpan sebagai lahan <b>{imported.field?.name}</b> — sudah bisa dipakai di Peta &amp; Spraying.</>
+                        : "Menyalin orthophoto & NDVI ke sistem ini agar bisa dipakai untuk Spraying dan fitur lain."}
+                    </p>
+                  </div>
                 )}
-                {kmlUrl && (
-                  <Button variant="outline" onClick={() => download(kmlUrl, `${id}-zona.kml`, "kml")} disabled={downloading === "kml"}>
-                    {downloading === "kml" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />} Unduh Zona (KML)
-                  </Button>
+                {imported && (
+                  <>
+                    <Button variant="outline" onClick={() => navigate("/maps")}>
+                      <MapPinned className="h-4 w-4" /> Buka di Peta
+                    </Button>
+                    <Button variant="outline" onClick={() => saveFile(imported.files.rgb_tif, `${id}-orthophoto.tif`)}>
+                      <Download className="h-4 w-4" /> Unduh Orthophoto
+                    </Button>
+                    <Button variant="outline" onClick={() => saveFile(imported.files.ndvi_tif, `${id}-ndvi.tif`)}>
+                      <Download className="h-4 w-4" /> Unduh NDVI
+                    </Button>
+                    {imported.files.zones_kml && (
+                      <Button variant="outline" onClick={() => saveFile(imported.files.zones_kml, `${id}-zona.kml`)}>
+                        <Download className="h-4 w-4" /> Unduh Zona (KML)
+                      </Button>
+                    )}
+                  </>
                 )}
                 {resumable && (
                   // MappingPlan picks the session up from `?resume=` and flies the
@@ -761,7 +814,7 @@ export function MappingDetail() {
                 <Button variant="outline" className={DESTRUCTIVE_OUTLINE_BTN} onClick={() => setModal("delete")} disabled={deleting}>
                   <Trash2 className="h-4 w-4" /> Hapus Pemetaan
                 </Button>
-                {!tifUrl && !kmlUrl && !busy && (
+                {!importable && !busy && (
                   <p className="text-xs text-muted-foreground">Belum ada artefak untuk diunduh.</p>
                 )}
               </Card>

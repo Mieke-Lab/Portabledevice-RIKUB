@@ -109,6 +109,7 @@ def normalize_session(job: dict[str, Any]) -> dict[str, Any]:
             "raw_dir": reachable_artifact_url(artifacts.get("raw_dir")) or artifacts.get("raw_dir"),
             "stitched_tif": reachable_artifact_url(artifacts.get("stitched_tif")),
             "clusters_kml": reachable_artifact_url(artifacts.get("clusters_kml")),
+            "ndvi_tif": reachable_artifact_url(artifacts.get("ndvi_tif")),
             "processed_dir": reachable_artifact_url(artifacts.get("processed_dir")),
         },
     }
