@@ -383,3 +383,79 @@ def test_normalize_session_now_forwards_ndvi_tif(monkeypatch):
     out = grpc_backend.normalize_session({"artifacts": {"ndvi_tif": "http://localhost:8000/sessions/a/ndvi.tif"}})
     assert out["artifacts"]["ndvi_tif"] == "http://192.0.2.10:8000/sessions/a/ndvi.tif"
     assert grpc_backend.normalize_session({"artifacts": {}})["artifacts"]["ndvi_tif"] is None
+
+
+# --- what the drone's stitcher actually writes ------------------------------------
+def write_ortho16(path, h=40, w=60):
+    """UInt16 RGBA like the drone's stitched.tif: dark (values ~2-12k of 65535)."""
+    rng = np.random.default_rng(2)
+    rgb = rng.integers(2000, 12000, (3, h, w)).astype("uint16")
+    rgb[:, 0, w // 2:] = 50          # very dark but valid: must not become nodata
+    alpha = np.full((h, w), 255, "uint16")
+    alpha[:, : w // 3] = 0
+    rgb[:, :, : w // 3] = 0
+    with rasterio.open(path, "w", driver="GTiff", dtype="uint16", count=4, width=w, height=h,
+                       crs="EPSG:32749", transform=from_origin(697000, 9195000, 0.5, 0.5)) as ds:
+        ds.write(rgb, [1, 2, 3])
+        ds.write(alpha, 4)
+        ds.colorinterp = [ColorInterp.red, ColorInterp.green, ColorInterp.blue, ColorInterp.alpha]
+
+
+def test_16bit_ortho_is_stretched_with_transparent_surround_kept(tmp_path, source):
+    src = tmp_path / "s16.tif"
+    write_ortho16(src)
+    map_import.check_rasters(src, source["dir"] / "ndvi.tif")  # accepted now
+    map_import.build_rgb_tif(src, tmp_path / "rgb.tif")
+    with rasterio.open(tmp_path / "rgb.tif") as ds:
+        assert (ds.count, ds.dtypes[0], ds.nodata, str(ds.crs)) == (3, "uint8", 0.0, "EPSG:32749")
+        out = ds.read()
+    w = out.shape[2]
+    assert (out[:, :, : w // 3] == 0).all()                  # transparent -> nodata
+    inside = out[:, :, w // 3:]
+    assert (inside >= 1).all()                                # nothing valid turned into nodata
+    assert inside[:, 1:, :].mean() > 60                       # stretched, not a black picture
+
+
+def test_projected_kml_is_rewritten_in_lon_lat(tmp_path, source):
+    kml = tmp_path / "z.kml"
+    kml.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?><kml xmlns="http://www.opengis.net/kml/2.2"><Document>'
+        "<Placemark><name>cluster_0</name><Polygon><outerBoundaryIs><LinearRing><coordinates>"
+        "697778.30,9194903.81,0 697773.30,9194903.31,0 697762.30,9194884.82,0 697778.30,9194903.81,0"
+        "</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark></Document></kml>"
+    )
+    assert map_import.kml_to_lonlat(kml, source["dir"] / "stitched.tif") == 1
+    text = kml.read_text()
+    assert "<kml" in text and 'xmlns="http://www.opengis.net/kml/2.2"' in text
+    coords = text.split("<coordinates>")[1].split("</coordinates>")[0].split()
+    lon, lat, z = map(float, coords[0].split(","))
+    assert 112.79 < lon < 112.80 and -7.29 < lat < -7.27 and z == 0
+    assert map_import.kml_to_lonlat(kml, source["dir"] / "stitched.tif") == 0   # idempotent
+
+
+def test_empty_kml_is_left_alone(tmp_path, source):
+    kml = tmp_path / "z.kml"
+    kml.write_text("<kml/>")
+    assert map_import.kml_to_lonlat(kml, source["dir"] / "stitched.tif") == 0
+    assert kml.read_text() == "<kml/>"
+
+
+# --- automatic import ----------------------------------------------------------
+def test_auto_import_picks_only_finished_drone_surveys(monkeypatch, source):
+    pts = {"points": [{"lat": -7.28, "lng": 112.79}]}
+    listed = [
+        session(source["base"], capture=pts),                                    # -> import
+        session(source["base"], id="20261011T000000_map-a", capture=pts, status="stitching"),
+        session(source["base"], id="sawah_jember", capture={}),                  # not drone-flown
+        session(source["base"], id="20261011T000001_map-b", capture=pts,
+                artifacts={"stitched_tif": f"{source['base']}/stitched.tif"}),  # no NDVI yet
+    ]
+    for s in listed:
+        s["job_id"] = s["id"]
+    monkeypatch.setattr(map_import, "call_grpc", lambda *a, **k: {"sessions": listed})
+    monkeypatch.setattr(database, "SessionLocal", lambda: FakeDB())
+    monkeypatch.setattr(map_import, "find_import", lambda sid, db: None)
+    started = []
+    monkeypatch.setattr(map_import.REGISTRY, "start", lambda plan: started.append(plan.session_id))
+    map_import._auto_import_once()
+    assert started == [SID]

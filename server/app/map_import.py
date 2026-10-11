@@ -26,10 +26,12 @@ status from the `source.json` marker written next to the imagery.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 import urllib.error
@@ -42,8 +44,10 @@ from urllib.parse import quote
 from uuid import UUID
 
 from fastapi import HTTPException
+from starlette.concurrency import run_in_threadpool
 
 from app.db import database
+from app.grpc_backend import call_grpc, normalize_session
 from app.db.models import Field, FieldImagery
 from app.routes import fields as fields_routes
 
@@ -54,6 +58,10 @@ _SLUG_STRIP = re.compile(r"[^a-z0-9._-]+")
 _CHUNK = 1 << 20
 _HTTP_TIMEOUT_S = 60
 MARKER_NAME = "source.json"
+JOBS = "/soerogis.MappingJobService"
+AUTO_SCAN_S = 60        # how often finished drone surveys are looked for
+AUTO_RETRY_S = 600      # a failed automatic import is retried after this
+STRETCH_PCT = (2, 98)   # 16-bit orthophotos: per-band percentile stretch to 1..255
 
 # One conversion at a time: gdal + the NDVI colourmap are memory-hungry on a Pi.
 _HEAVY = threading.Lock()
@@ -176,6 +184,50 @@ def download_file(
         part.unlink(missing_ok=True)
 
 
+def _stretch_to_uint8(src: Path, dest: Path) -> None:
+    """16-bit orthophoto -> 3-band uint8 with nodata 0.
+
+    The drone's stitcher writes UInt16 RGBA with most values in the low quarter of
+    the range, so a plain max-scale gives a near-black picture. Each band is
+    stretched between its 2nd/98th percentile onto 1..255 (clamped — gdal_translate
+    -scale extrapolates below the low end, which would turn dark pixels into the
+    nodata 0); pixels the alpha band marks transparent become 0.
+    """
+    import numpy as np
+    import rasterio
+    from rasterio.enums import ColorInterp, Resampling
+
+    with rasterio.open(src) as ds:
+        alpha = next((i + 1 for i, ci in enumerate(ds.colorinterp) if ci == ColorInterp.alpha), None)
+        step = max(1, max(ds.width, ds.height) // 1024)
+        shape = (max(1, ds.height // step), max(1, ds.width // step))
+        small = ds.read([1, 2, 3], out_shape=(3, *shape), resampling=Resampling.nearest)
+        if alpha:
+            valid = ds.read(alpha, out_shape=shape, resampling=Resampling.nearest) > 0
+        else:
+            valid = (small > 0).any(axis=0)
+        ranges = []
+        for band in small:
+            values = band[valid]
+            lo, hi = (np.percentile(values, STRETCH_PCT) if values.size else (0.0, 65535.0))
+            ranges.append((float(lo), float(hi) if hi > lo else float(lo) + 1.0))
+
+        profile = {
+            "driver": "GTiff", "dtype": "uint8", "count": 3, "nodata": 0,
+            "width": ds.width, "height": ds.height, "crs": ds.crs, "transform": ds.transform,
+            "tiled": True, "blockxsize": 256, "blockysize": 256, "compress": "deflate",
+        }
+        with rasterio.open(dest, "w", **profile) as out:
+            for _, win in ds.block_windows(1):
+                rgb = ds.read([1, 2, 3], window=win).astype("float32")
+                mask = ds.read(alpha, window=win) > 0 if alpha else (rgb > 0).any(axis=0)
+                res = np.empty(rgb.shape, "uint8")
+                for b, (lo, hi) in enumerate(ranges):
+                    res[b] = np.clip((rgb[b] - lo) * (254.0 / (hi - lo)) + 1.0, 1, 255)
+                res[:, ~mask] = 0
+                out.write(res, window=win)
+
+
 def build_rgb_tif(src: Path, dest: Path) -> None:
     """Orthophoto -> 3-band uint8 ``rgb.tif`` (R, G, NIR) with nodata 0.
 
@@ -183,6 +235,17 @@ def build_rgb_tif(src: Path, dest: Path) -> None:
     half-written rgb.tif that the register step would convert.
     """
     tmp = dest.with_name(dest.name + ".new")
+    import rasterio
+
+    with rasterio.open(src) as ds:
+        sixteen_bit = ds.dtypes[0] == "uint16"
+    if sixteen_bit:
+        try:
+            _stretch_to_uint8(src, tmp)
+            os.replace(tmp, dest)
+        finally:
+            tmp.unlink(missing_ok=True)
+        return
     try:
         fields_routes.run_gdal_command([
             "gdal_translate", "-q", "-of", "GTiff",
@@ -206,9 +269,9 @@ def check_rasters(stitched: Path, ndvi: Path) -> None:
         raise ImportFailed("rasterio tidak terpasang di server") from exc
     try:
         with rasterio.open(stitched) as ds:
-            if ds.count < 3 or ds.dtypes[0] != "uint8":
+            if ds.count < 3 or ds.dtypes[0] not in ("uint8", "uint16"):
                 raise ImportFailed(
-                    f"stitched.tif tidak seperti yang diharapkan ({ds.count} band, {ds.dtypes[0]}; perlu >=3 band uint8)"
+                    f"stitched.tif tidak seperti yang diharapkan ({ds.count} band, {ds.dtypes[0]}; perlu >=3 band uint8/uint16)"
                 )
         with rasterio.open(ndvi) as ds:
             if ds.count != 1 or not ds.dtypes[0].startswith("float"):
@@ -219,6 +282,45 @@ def check_rasters(stitched: Path, ndvi: Path) -> None:
         raise ImportFailed(f"File raster tidak terbaca: {exc}") from exc
 
 
+def kml_to_lonlat(kml: Path, reference_tif: Path) -> int:
+    """Rewrite ``kml`` in place with lon/lat coordinates; returns rings converted.
+
+    The stitcher writes the zone rings in the orthophoto's projected metres (UTM),
+    which breaks the KML spec and every reader of it (the zones landed at "latitude
+    9,194,903" and summed to 2.6 billion ha). The CRS is taken from the orthophoto;
+    rings already in lon/lat are left alone.
+    """
+    import xml.etree.ElementTree as ET
+
+    import rasterio
+    from pyproj import Transformer
+
+    tree = ET.parse(kml)
+    coord_elems = [el for el in tree.iter() if el.tag.endswith("coordinates") and (el.text or "").strip()]
+
+    def parse(text: str) -> list[list[float]]:
+        return [[float(v) for v in tup.split(",")] for tup in text.split()]
+
+    projected = [el for el in coord_elems if any(abs(p[0]) > 180 or abs(p[1]) > 90 for p in parse(el.text))]
+    if not projected:
+        return 0
+    with rasterio.open(reference_tif) as ds:
+        if ds.crs is None:
+            raise ImportFailed("Zona KML dalam meter tapi CRS orthophoto tidak diketahui")
+        to_wgs84 = Transformer.from_crs(ds.crs, "EPSG:4326", always_xy=True)
+    for el in projected:
+        out = []
+        for p in parse(el.text):
+            lon, lat = to_wgs84.transform(p[0], p[1])
+            out.append(",".join([f"{lon:.8f}", f"{lat:.8f}", *(f"{v:g}" for v in p[2:])]))
+        el.text = " ".join(out)
+    root_tag = tree.getroot().tag
+    if root_tag.startswith("{"):
+        ET.register_namespace("", root_tag[1:].split("}")[0])
+    tree.write(kml, encoding="UTF-8", xml_declaration=True)
+    return len(projected)
+
+
 def _files_for(rel_dir: str, has_kml: bool) -> dict[str, str | None]:
     base = "/" + "/".join(quote(part) for part in rel_dir.removeprefix("storage/").split("/"))
     return {
@@ -226,6 +328,16 @@ def _files_for(rel_dir: str, has_kml: bool) -> dict[str, str | None]:
         "ndvi_tif": f"{base}/ndvi.tif",
         "zones_kml": f"{base}/zones.kml" if has_kml else None,
     }
+
+
+def _lower_thread_priority() -> None:
+    """Nice this worker thread (and the gdal processes it spawns) to 19: the Pi's
+    supply browns out under full CPU load. Linux nice values are per thread."""
+    if sys.platform.startswith("linux"):
+        try:
+            os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 19)
+        except OSError:
+            pass
 
 
 def import_session(plan: ImportPlan, progress: Progress) -> dict[str, Any]:
@@ -244,6 +356,7 @@ def import_session(plan: ImportPlan, progress: Progress) -> dict[str, Any]:
             progress(step, int(lo + (hi - lo) * frac), f"{label} ({mb:.0f} MB)")
         return cb
 
+    _lower_thread_priority()
     try:
         progress("download-ortho", 1, "Mengunduh orthophoto…")
         download_file(plan.stitched_url, tmp_stitched, scaled(1, 40, "Mengunduh orthophoto", "download-ortho"))
@@ -260,6 +373,12 @@ def import_session(plan: ImportPlan, progress: Progress) -> dict[str, Any]:
 
         progress("prepare", 72, "Menyiapkan RGB (R + G + NIR)…")
         check_rasters(tmp_stitched, tmp_ndvi)
+        if has_kml:
+            try:
+                kml_to_lonlat(tmp_kml, tmp_stitched)
+            except Exception as exc:  # noqa: BLE001 — zones are optional; never ship UTM ones
+                log.warning("zones KML dropped for %s: %s", plan.session_id, exc)
+                has_kml = False
         build_rgb_tif(tmp_stitched, cap_dir / "rgb.tif")
         os.replace(tmp_ndvi, cap_dir / "ndvi.tif")
         if has_kml:
@@ -381,3 +500,57 @@ def find_import(session_id: str, db) -> dict[str, Any] | None:
             "files": _files_for(rel_dir, (marker.parent / "zones.kml").is_file()),
         }
     return None
+
+
+# --- automatic import of finished drone surveys ----------------------------------------
+
+def _auto_import_once() -> None:
+    """Start an import for every drone-flown session that is stitched (status ready,
+    with an orthophoto and NDVI) and not in this system yet."""
+    result = call_grpc(f"{JOBS}/ListJobs", {"capture_only": True}, 30)
+    sessions = result if isinstance(result, list) else (result.get("sessions") or result.get("jobs") or [])
+    if not sessions or database.SessionLocal is None:
+        return
+    db = database.SessionLocal()
+    try:
+        for raw in sessions:
+            session = normalize_session(raw)
+            sid = str(session.get("id") or session.get("job_id") or "")
+            artifacts = session.get("artifacts") or {}
+            capture = session.get("capture") or {}
+            if (not SESSION_ID_RE.match(sid) or session.get("status") != "ready"
+                    or not artifacts.get("stitched_tif") or not artifacts.get("ndvi_tif")
+                    or not capture.get("points")):
+                continue
+            state = REGISTRY.get(sid)
+            if state and (state["state"] in ("running", "done") or (
+                    state["state"] == "failed" and time.time() - (state.get("finished_at") or 0) < AUTO_RETRY_S)):
+                continue
+            if find_import(sid, db):
+                continue
+            try:
+                REGISTRY.start(plan_import(session, None))
+                log.info("auto import started for %s", sid)
+            except HTTPException as exc:
+                log.warning("auto import skipped %s: %s", sid, exc.detail)
+    finally:
+        db.close()
+
+
+async def _auto_import_loop() -> None:
+    while True:
+        try:
+            await run_in_threadpool(_auto_import_once)
+        except Exception:  # noqa: BLE001 — drone off / out of range: try again next round
+            log.debug("auto import scan failed", exc_info=True)
+        await asyncio.sleep(AUTO_SCAN_S)
+
+
+_auto_task: asyncio.Task | None = None
+
+
+def start_auto_import() -> None:
+    """Called from the app lifespan: watch for finished drone surveys and import them."""
+    global _auto_task
+    if _auto_task is None or _auto_task.done():
+        _auto_task = asyncio.create_task(_auto_import_loop())

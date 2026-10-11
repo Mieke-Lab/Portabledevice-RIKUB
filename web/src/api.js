@@ -287,3 +287,25 @@ export const resetCameraDefaults = () => cameraCall('/tuning/reset', {});
 export const saveCameraPreset = () => cameraCall('/preset/save', {});
 export const loadCameraPreset = () => cameraCall('/preset/load', {});
 export const getCameraMetrics = () => cameraCall('/metrics');
+
+// Offline base maps (server/app/routes/tiles.py): stored tiles per layer, and
+// pre-downloading an area so the map still loads without internet.
+async function tilesCall(path, method = 'GET', body) {
+  const res = await fetch(`/api/tiles${path}`, body === undefined ? { method } : {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+  return data;
+}
+
+export const getTileStats = () => tilesCall('/stats');
+// area: {layers, south, west, north, east, min_zoom, max_zoom}; dryRun only counts.
+export const startTileDownload = (area, dryRun = false) =>
+  tilesCall('/download', 'POST', { ...area, dry_run: dryRun });
+export const getTileDownload = () => tilesCall('/download');
+export const cancelTileDownload = () => tilesCall('/download', 'DELETE');
+// Background caching of an area a page shows; no progress, skips stored tiles.
+export const prefetchTiles = (area) => tilesCall('/prefetch', 'POST', area);

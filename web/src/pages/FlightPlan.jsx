@@ -3,7 +3,7 @@ import { useNavigate, useLocation } from "react-router-dom";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 import { ArrowLeft, Route as RouteIcon, MapPinned } from "lucide-react";
-import { BASE_LAYERS } from "@/components/maps/mapConfig";
+import { createBaseTileLayer, prefetchMapArea } from "@/components/maps/baseTiles";
 import { COVERAGE_PATH_STYLE, flagIcon } from "@/components/maps/flightPath";
 import { DroneTelemetryProvider } from "@/components/gcs/DroneTelemetryProvider";
 import { diagnosticsCoords, headingDeg, useDiagnostics } from "@/lib/gcs/diagnostics";
@@ -231,12 +231,7 @@ export function FlightPlan() {
     });
     map.current = m;
 
-    const sat = BASE_LAYERS.satellite;
-    L.tileLayer(sat.url, {
-      attribution: sat.attribution,
-      maxNativeZoom: sat.maxNativeZoom,
-      maxZoom: sat.maxZoom,
-    }).addTo(m);
+    createBaseTileLayer("satellite").addTo(m);
 
     L.geoJSON(input.featureCollection, {
       interactive: false, // let map clicks pass through for obstacle drawing
@@ -287,13 +282,12 @@ export function FlightPlan() {
 
     const bounds = targetsBounds(targets);
     if (bounds) {
-      m.fitBounds(
-        [
-          [bounds.minLat, bounds.minLng],
-          [bounds.maxLat, bounds.maxLng],
-        ],
-        { padding: [60, 60], maxZoom: 21 },
-      );
+      const corners = [
+        [bounds.minLat, bounds.minLng],
+        [bounds.maxLat, bounds.maxLng],
+      ];
+      m.fitBounds(corners, { padding: [60, 60], maxZoom: 21 });
+      prefetchMapArea(corners);
     }
 
     return () => {

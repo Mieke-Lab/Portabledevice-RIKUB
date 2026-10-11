@@ -17,13 +17,17 @@ from app.routes.jobs import router as jobs_router
 from app.routes.kiosk import router as kiosk_router
 from app.routes.manual_zones import imagery_router as manual_zones_imagery_router
 from app.routes.manual_zones import polygon_router as manual_zones_polygon_router
+from app.routes.mission_plans import router as mission_plans_router
+from app.map_import import start_auto_import
 from app.routes.sensor import router as sensor_router, start_reader
+from app.routes.tiles import router as tiles_router
 from app.security import add_security_middleware
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     start_reader()  # begin reading the soil sensor's UART stream in the background
+    start_auto_import()  # finished drone surveys -> field imagery (SmartGIS overlays)
     yield
 
 
@@ -43,6 +47,8 @@ app.include_router(detection_proxy_router)
 app.include_router(kiosk_router)
 app.include_router(manual_zones_imagery_router)
 app.include_router(manual_zones_polygon_router)
+app.include_router(tiles_router)
+app.include_router(mission_plans_router)
 app.mount(
     "/imagery",
     StaticFiles(directory=Path(__file__).resolve().parents[1] / "storage" / "imagery"),

@@ -17,10 +17,47 @@ export function readMissionPlan() {
   return parse(window.sessionStorage.getItem(MISSION_PLAN_KEY));
 }
 
-export function setMissionPlan(plan) {
-  if (typeof window === "undefined") return;
+function setLocal(plan) {
   window.sessionStorage.setItem(MISSION_PLAN_KEY, JSON.stringify(plan));
   window.dispatchEvent(new Event(MISSION_PLAN_EVENT));
+}
+
+// The tab's copy is only a cache: the launched plan is also kept on the Pi
+// (server/app/routes/mission_plans.py) so it survives closing the app or a reboot.
+export function setMissionPlan(plan) {
+  if (typeof window === "undefined") return;
+  setLocal(plan);
+  fetch("/api/mission-plans", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(plan),
+  }).catch(() => {});
+}
+
+const LATEST_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Bring back the plan of the spray session the drone reports (or, with no session,
+ * a plan launched in the last few hours) after the tab lost it. Resolves to the
+ * restored plan or null.
+ */
+export async function restoreMissionPlan(sessionId) {
+  if (typeof window === "undefined") return null;
+  const url = sessionId ? `/api/mission-plans/${encodeURIComponent(sessionId)}` : "/api/mission-plans/latest";
+  try {
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) return null;
+    const plan = await res.json();
+    if (!plan || typeof plan !== "object") return null;
+    if (!sessionId) {
+      const age = Date.now() - Date.parse(plan.createdAt || "");
+      if (!(age >= 0 && age < LATEST_MAX_AGE_MS)) return null;
+    }
+    setLocal(plan);
+    return plan;
+  } catch {
+    return null;
+  }
 }
 
 export function clearMissionPlan() {

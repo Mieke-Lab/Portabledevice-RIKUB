@@ -44,13 +44,17 @@ vm.dirty_writeback_centisecs=500
 CONF
 sysctl -q --system
 
-# 5. Keep the journal small (fewer, shorter SD writes). Stays persistent so
-#    undervoltage events are still readable after a crash.
-mkdir -p /etc/systemd/journald.conf.d
+# 5. Keep the journal small (fewer, shorter SD writes) but persistent, so
+#    undervoltage / black-screen events are still readable after a reboot.
+#    (Raspberry Pi OS ships without /var/log/journal, i.e. RAM-only logs.)
+mkdir -p /etc/systemd/journald.conf.d /var/log/journal
 cat > /etc/systemd/journald.conf.d/90-rikub.conf <<'CONF'
 [Journal]
+Storage=persistent
 SystemMaxUse=64M
 CONF
+systemd-tmpfiles --create --prefix /var/log/journal
+systemctl restart systemd-journald
 
 # 6. Services this device doesn't use: less idle power, fewer wakeups and writes.
 systemctl disable --now bluetooth.service nfs-blkmap.service \

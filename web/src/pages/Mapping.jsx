@@ -7,10 +7,11 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import { fetchJobs, createJobFromFolder, pauseMappingMission } from "@/lib/gcs/api";
+import { fetchJobs, createJobFromFolder, pauseMappingMission, fetchMappingMissionStatus } from "@/lib/gcs/api";
 import {
   captureOf, captureStateMeta, captureProgress, captureSummary,
   isCaptureSession, isCaptureInFlight, isCaptureResumable, isCapturePausable, needsAttention,
+  isMappingLegActive, withLiveLeg,
 } from "@/lib/gcs/mapping-capture";
 
 // Lifecycle of a MappingJobService session (docs/mapping.md). `busy` drives the
@@ -479,7 +480,10 @@ function CreateModal({ onClose, onCreated }) {
 
 export function Mapping() {
   const navigate = useNavigate();
-  const [jobs, setJobs] = useState([]);
+  const [rawJobs, setJobs] = useState([]);
+  // The drone's live leg: overrides the persisted flight state, which can lag.
+  const [liveLeg, setLiveLeg] = useState(null);
+  const jobs = useMemo(() => rawJobs.map((j) => withLiveLeg(j, liveLeg)), [rawJobs, liveLeg]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -509,9 +513,10 @@ export function Mapping() {
     let timer;
     async function tick() {
       try {
-        const data = await fetchJobs();
+        const [data, live] = await Promise.all([fetchJobs(), fetchMappingMissionStatus().catch(() => null)]);
         if (!alive) return;
         const list = Array.isArray(data) ? data : [];
+        setLiveLeg(live);
         setJobs(list);
         setError(null);
         // Every non-terminal status is transient (clustering runs automatically
@@ -519,7 +524,7 @@ export function Mapping() {
         // idle down only once nothing is in flight. A flying mission is spelled
         // out explicitly: its `status` is a plain `unstitched` the whole time and
         // the live part is `capture.state` / `capture.captured`.
-        const anyBusy = list.some((j) => !TERMINAL.has(j.status) || isCaptureInFlight(j));
+        const anyBusy = isMappingLegActive(live) || list.some((j) => !TERMINAL.has(j.status) || isCaptureInFlight(j));
         timer = setTimeout(tick, anyBusy ? 4000 : 20000);
       } catch (e) {
         if (!alive) return;

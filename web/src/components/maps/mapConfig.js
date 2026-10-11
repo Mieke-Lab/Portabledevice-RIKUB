@@ -3,31 +3,31 @@ export const BASE_BOUNDS = [
   [-8.05923, 113.90625],
 ];
 
+// Base maps come through the Pi (server/app/routes/tiles.py): every tile shown is kept
+// on disk, so a map viewed or downloaded once still loads without internet.
 export const BASE_LAYERS = {
   default: {
     label: "Default",
-    preview: "https://a.tile.openstreetmap.org/5/26/16.png",
-    attribution:
-      '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-    url: "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+    preview: "/api/tiles/default/5/26/16?v=esri",
+    attribution: "Tiles &copy; Esri",
+    url: "/api/tiles/default/{z}/{x}/{y}?v=esri", // ?v: the browser cached OSM "blocked" tiles for 7 days
     maxNativeZoom: 19,
     maxZoom: 24,
   },
   satellite: {
     label: "Satelit",
-    preview:
-      "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/5/16/26",
+    preview: "/api/tiles/satellite/5/26/16",
     attribution: "Tiles &copy; Esri",
-    url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    url: "/api/tiles/satellite/{z}/{x}/{y}",
     maxNativeZoom: 18,
     maxZoom: 24,
   },
   terrain: {
     label: "Terrain",
-    preview: "https://a.tile.opentopomap.org/5/26/16.png",
+    preview: "/api/tiles/terrain/5/26/16",
     attribution:
       'Map data: &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors | Map style: &copy; <a href="https://opentopomap.org">OpenTopoMap</a>',
-    url: "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+    url: "/api/tiles/terrain/{z}/{x}/{y}",
     maxNativeZoom: 17,
     maxZoom: 24,
   },

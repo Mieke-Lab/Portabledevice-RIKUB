@@ -1,15 +1,17 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 import { ArrowLeft, LocateFixed, Radar } from "lucide-react";
-import { BASE_LAYERS } from "@/components/maps/mapConfig";
+import { createBaseTileLayer, prefetchMapArea } from "@/components/maps/baseTiles";
 import { DroneTelemetryProvider } from "@/components/gcs/DroneTelemetryProvider";
-import { MonitoringPanel } from "@/components/maps/monitoring/MonitoringPanel";
+import { MonitoringPanel, STATION_COLORS } from "@/components/maps/monitoring/MonitoringPanel";
 import { diagnosticsCoords, headingDeg, isStale, useDiagnostics } from "@/lib/gcs/diagnostics";
 import { useDroneSettings } from "@/lib/gcs/drone-settings";
-import { useMissionPlan } from "@/lib/gcs/mission-plan";
+import { restoreMissionPlan, useMissionPlan } from "@/lib/gcs/mission-plan";
 import { useSprayStatus } from "@/lib/gcs/spray-status";
+import { useMappingStatus } from "@/lib/gcs/mapping-status";
+import { capturePointsForDisplay, isMappingLegActive } from "@/lib/gcs/mapping-capture";
 import { cancelSprayMission } from "@/lib/gcs/api";
 import {
   useDroneOffset,
@@ -36,6 +38,8 @@ const MAX_SPRAY_CIRCLES = 12000;
 const PLANNED_PATH_STYLE = { color: "rgba(255,255,255,0.85)", weight: 2, opacity: 0.9, dashArray: "3 7", interactive: false };
 const TRAIL_STYLE = { color: "#34d399", weight: 3, opacity: 0.9, interactive: false };
 const ZONE_STYLE = { color: "rgba(255,255,255,0.72)", weight: 1.5, fillColor: "#ffffff", fillOpacity: 0.06, interactive: false };
+const STATION_STYLE = { radius: 4, color: "#ffffff", weight: 1.5, fillOpacity: 1, interactive: false };
+const SPRAY_ACTIVE_PHASES = ["armed", "standby", "spraying"];
 
 function droneIcon(rotationDeg) {
   // The lucide "Plane" glyph points ~45° NE at rest, so subtract 45 to align the
@@ -66,6 +70,35 @@ export function Monitoring() {
   const [{ pollIntervalMs }] = useDroneSettings();
   const plan = useMissionPlan();
   const { status: sprayStatus, samples: spraySamples } = useSprayStatus();
+  const { status: mappingStatus, job: mappingJob } = useMappingStatus();
+
+  // Which mission the page shows: one in progress first (the drone runs one at a
+  // time), then a loaded spray plan, then whichever last reported something.
+  const sprayActive = sprayStatus?.running === true || SPRAY_ACTIVE_PHASES.includes(sprayStatus?.phase);
+  const mappingActive = isMappingLegActive(mappingStatus);
+  const mode = sprayActive
+    ? "spray"
+    : mappingActive
+      ? "mapping"
+      : planPathLatLngs(plan).length >= 2 || (sprayStatus?.phase && sprayStatus.phase !== "idle")
+        ? "spray"
+        : mappingStatus?.phase && mappingStatus.phase !== "idle"
+          ? "mapping"
+          : "idle";
+  const mappingSessionId = mappingStatus?.odm_job_id || mappingStatus?.session_id || "";
+
+  // After the app was closed or the Pi rebooted mid-mission, the tab has no plan
+  // (or an older one): fetch the plan of the spray session the drone reports.
+  const spraySessionId = sprayStatus?.session_id || "";
+  const restoreTried = useRef(new Set());
+  useEffect(() => {
+    if (!sprayStatus) return; // first poll not back yet
+    const key = spraySessionId || "latest";
+    if (spraySessionId ? plan?.sessionId === spraySessionId : plan) return;
+    if (restoreTried.current.has(key)) return;
+    restoreTried.current.add(key);
+    restoreMissionPlan(spraySessionId || null);
+  }, [sprayStatus, spraySessionId, plan]);
 
   // The live marker/trail are shifted by the GPS drift so they sit where the
   // drone truly is over the field (display = reported + Δ); the planned path/zones
@@ -75,7 +108,8 @@ export function Monitoring() {
   // even if the operator recalibrates/resets afterwards. Only when no mission is
   // loaded (just watching telemetry) do we fall back to the live calibration.
   const liveOffset = useDroneOffset();
-  const offset = plan ? plan.gpsOffset ?? ZERO_OFFSET : liveOffset;
+  // A mapping survey is pushed with the live calibration, like MappingPlan shows it.
+  const offset = plan && mode !== "mapping" ? plan.gpsOffset ?? ZERO_OFFSET : liveOffset;
   const displayDrone = applyOffsetToCoords(diagnosticsCoords(diagnosticsData), offset);
   const droneLat = displayDrone?.lat ?? null;
   const droneLon = displayDrone?.lng ?? null;
@@ -92,13 +126,15 @@ export function Monitoring() {
   const zonesLayer = useRef(null);
   const pathLayer = useRef(null);
   const trailLayer = useRef(null);
+  const stationsRoute = useRef(null);
+  const stationsLayer = useRef(null);
   const sprayGroup = useRef(null);
   const sprayLayers = useRef([]); // drawn circles, oldest-first, for the safety cap
   const droneMarker = useRef(null);
   const trailPts = useRef([]);
   const lastDrawnSeq = useRef(-Infinity);
   const renderedSession = useRef(undefined);
-  const fitDone = useRef(false);
+  const fitDone = useRef(null); // null | "drone" | "mission" — a mission fit may replace a drone-only one
 
   // Create the map + layer stack once. Order: zones (bottom) → sprayed overlay
   // → planned path → trail; the drone marker sits above everything.
@@ -108,11 +144,12 @@ export function Monitoring() {
     map.current = m;
     m.setView(DEFAULT_CENTER, DEFAULT_ZOOM);
 
-    const sat = BASE_LAYERS.satellite;
-    L.tileLayer(sat.url, { attribution: sat.attribution, maxNativeZoom: sat.maxNativeZoom, maxZoom: sat.maxZoom }).addTo(m);
+    createBaseTileLayer("satellite").addTo(m);
 
     zonesLayer.current = L.layerGroup().addTo(m);
     sprayGroup.current = L.layerGroup().addTo(m);
+    stationsRoute.current = L.polyline([], PLANNED_PATH_STYLE).addTo(m);
+    stationsLayer.current = L.layerGroup().addTo(m);
     pathLayer.current = L.polyline([], PLANNED_PATH_STYLE).addTo(m);
     trailLayer.current = L.polyline([], TRAIL_STYLE).addTo(m);
 
@@ -124,6 +161,8 @@ export function Monitoring() {
       sprayLayers.current = [];
       pathLayer.current = null;
       trailLayer.current = null;
+      stationsRoute.current = null;
+      stationsLayer.current = null;
       droneMarker.current = null;
     };
   }, []);
@@ -133,35 +172,62 @@ export function Monitoring() {
   // user's own panning while they watch the flight.
   function tryFit() {
     const m = map.current;
-    if (!m || fitDone.current) return;
-    const pts = planPathLatLngs(plan);
-    for (const zone of Array.isArray(plan?.zones) ? plan.zones : []) {
-      for (const point of Array.isArray(zone?.polygon) ? zone.polygon : []) {
-        if (Number.isFinite(point[0]) && Number.isFinite(point[1])) pts.push(point);
+    if (!m || fitDone.current === "mission") return;
+    let pts;
+    if (mode === "mapping") {
+      pts = stations.map((p) => [p.lat, p.lng]);
+    } else {
+      pts = planPathLatLngs(plan);
+      for (const zone of Array.isArray(plan?.zones) ? plan.zones : []) {
+        for (const point of Array.isArray(zone?.polygon) ? zone.polygon : []) {
+          if (Number.isFinite(point[0]) && Number.isFinite(point[1])) pts.push(point);
+        }
       }
     }
     if (pts.length >= 2) {
       m.fitBounds(L.latLngBounds(pts), { padding: [70, 70], maxZoom: 21 });
-      fitDone.current = true;
+      prefetchMapArea(pts);
+      fitDone.current = "mission";
       return;
     }
-    if (droneLat != null && droneLon != null) {
+    if (!fitDone.current && droneLat != null && droneLon != null) {
       m.setView([droneLat, droneLon], 18);
-      fitDone.current = true;
+      prefetchMapArea([[droneLat, droneLon]]);
+      fitDone.current = "drone";
     }
   }
 
-  // Render the planned mission (target zones + intended flight path).
+  // Mapping survey stations, coloured by capture status, along the flown order.
+  const stations = useMemo(
+    () => (mode === "mapping" ? capturePointsForDisplay(mappingJob, offset) : []),
+    [mode, mappingJob, offset],
+  );
+
+  // Render the planned spray mission (target zones + intended flight path); hidden
+  // while a mapping survey is shown so a stale spray plan doesn't overlay it.
   useEffect(() => {
     if (!map.current || !zonesLayer.current || !pathLayer.current) return;
     zonesLayer.current.clearLayers();
-    for (const zone of Array.isArray(plan?.zones) ? plan.zones : []) {
+    const showPlan = mode !== "mapping";
+    for (const zone of showPlan && Array.isArray(plan?.zones) ? plan.zones : []) {
       const ring = Array.isArray(zone?.polygon) ? zone.polygon : [];
       if (ring.length >= 3) L.polygon(ring, ZONE_STYLE).addTo(zonesLayer.current);
     }
-    pathLayer.current.setLatLngs(planPathLatLngs(plan));
+    pathLayer.current.setLatLngs(showPlan ? planPathLatLngs(plan) : []);
     tryFit();
-  }, [plan]);
+  }, [plan, mode]);
+
+  useEffect(() => {
+    const group = stationsLayer.current;
+    if (!group || !stationsRoute.current) return;
+    group.clearLayers();
+    stationsRoute.current.setLatLngs(stations.map((p) => [p.lat, p.lng]));
+    for (const p of stations) {
+      const fillColor = STATION_COLORS[p.status] ?? STATION_COLORS.remaining;
+      L.circleMarker([p.lat, p.lng], { ...STATION_STYLE, fillColor }).addTo(group);
+    }
+    tryFit();
+  }, [stations]);
 
   // Live drone marker + accumulated flight trail.
   useEffect(() => {
@@ -192,11 +258,11 @@ export function Monitoring() {
     tryFit();
   }, [droneLat, droneLon, heading]);
 
-  // Reset the trail when a new spray session begins.
+  // Reset the trail when a new spray or mapping session begins.
   useEffect(() => {
     trailPts.current = [];
     trailLayer.current?.setLatLngs([]);
-  }, [sprayStatus?.session_id]);
+  }, [sprayStatus?.session_id, mappingSessionId]);
 
   // Paint the realtime sprayed-area overlay. New samples only (tracked by their
   // monotonic `seq`), so panning/zooming never re-draws the whole track.
@@ -251,10 +317,7 @@ export function Monitoring() {
     }
   }
 
-  const hasMission =
-    sprayStatus?.running === true ||
-    ["armed", "standby", "spraying"].includes(sprayStatus?.phase) ||
-    planPathLatLngs(plan).length >= 2;
+  const hasMission = sprayActive || mappingActive || planPathLatLngs(plan).length >= 2;
 
   return (
     <div className="flex h-full flex-col">
@@ -292,7 +355,7 @@ export function Monitoring() {
 
         {!hasMission && (
           <div className="pointer-events-none absolute left-1/2 top-4 z-[1000] -translate-x-1/2 rounded-full bg-house/90 px-4 py-1.5 text-[11px] font-bold text-slate-100 shadow-[0_10px_24px_rgba(2,6,23,0.35)] backdrop-blur">
-            Belum ada misi penyemprotan aktif
+            Belum ada misi aktif
           </div>
         )}
 
@@ -305,7 +368,12 @@ export function Monitoring() {
 
         <div className="pointer-events-none absolute right-4 top-4 bottom-4 z-[1000] flex items-start">
           <MonitoringPanel
-            fieldName={plan?.fieldName}
+            mode={mode}
+            mapping={mode === "mapping" ? { status: mappingStatus, job: mappingJob } : null}
+            onOpenMapping={
+              mappingSessionId ? () => navigate(`/mapping/${encodeURIComponent(mappingSessionId)}`) : undefined
+            }
+            fieldName={mode === "mapping" ? mappingJob?.area_name || mappingJob?.name : plan?.fieldName}
             diagnostics={diagnosticsData}
             online={online}
             stale={stale}

@@ -12,16 +12,16 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import {
   fetchJob, cancelJob, removeJob, isPreconditionError,
-  pauseMappingMission, cancelMappingMission, startJobImport, fetchJobImport,
+  pauseMappingMission, cancelMappingMission, fetchMappingMissionStatus, startJobImport, fetchJobImport,
 } from "@/lib/gcs/api";
 import {
   captureOf, captureProgress, captureStateMeta, capturePointsForDisplay,
-  isCaptureSession, isCaptureActive, isCaptureResumable, isCapturePausable,
+  isCaptureSession, isCaptureActive, isCaptureResumable, isCapturePausable, withLiveLeg,
 } from "@/lib/gcs/mapping-capture";
 import { useDroneOffset } from "@/lib/gcs/drone-offset";
 import { parseKml } from "@/lib/gcs/kml";
 import { fetchBlobWithProgress } from "@/lib/gcs/fetch-progress";
-import { BASE_LAYERS } from "@/components/maps/mapConfig";
+import { createBaseTileLayer } from "@/components/maps/baseTiles";
 import { DEFAULT_CENTER, DEFAULT_ZOOM } from "@/lib/gcs/basemap";
 
 const STATUS_LABEL = {
@@ -173,7 +173,10 @@ export function MappingDetail() {
   // but the session is still there — a failed cancel / delete.
   const [pollEpoch, setPollEpoch] = useState(0);
 
-  const [job, setJob] = useState(null);
+  const [sessionJob, setJob] = useState(null);
+  // The drone's live leg: overrides the persisted flight state, which can lag.
+  const [liveLeg, setLiveLeg] = useState(null);
+  const job = useMemo(() => withLiveLeg(sessionJob, liveLeg), [sessionJob, liveLeg]);
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
   const [error, setError] = useState(null);
@@ -247,12 +250,7 @@ export function MappingDetail() {
     const container = mapDiv.current;
     if (!container) return;
     const m = L.map(container, { attributionControl: true });
-    const meta = BASE_LAYERS.satellite;
-    L.tileLayer(meta.url, {
-      attribution: meta.attribution,
-      maxNativeZoom: meta.maxNativeZoom,
-      maxZoom: meta.maxZoom,
-    }).addTo(m);
+    createBaseTileLayer("satellite").addTo(m);
     m.setView([DEFAULT_CENTER[1], DEFAULT_CENTER[0]], DEFAULT_ZOOM);
     map.current = m;
     setMapReady(true);
@@ -278,6 +276,11 @@ export function MappingDetail() {
       try {
         const j = await fetchJob(id);
         if (!alive || gen !== pollGen.current) return;
+        if (isCaptureSession(j)) {
+          const live = await fetchMappingMissionStatus().catch(() => null);
+          if (!alive || gen !== pollGen.current) return;
+          setLiveLeg(live);
+        }
         setJob(j);
         setError(null);
         setLoading(false);

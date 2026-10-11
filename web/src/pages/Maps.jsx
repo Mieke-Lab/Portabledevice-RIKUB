@@ -47,9 +47,9 @@ import { defaultRateForChamber, chamberDisplayLabel, chamberSideLabel } from "@/
 import { productById } from "@/lib/gcs/product-doses";
 import { setFlightPlanInput } from "@/lib/gcs/flight-plan-input";
 import { LoadMissionFileButton } from "@/components/gcs/LoadMissionFileButton";
+import { createBaseTileLayer, prefetchMapArea } from "@/components/maps/baseTiles";
 import {
   BASE_BOUNDS,
-  BASE_LAYERS,
   DEFAULT_NDVI_CATEGORIES,
   DEFAULT_NDVI_ZONE_SETTINGS,
 } from "@/components/maps/mapConfig";
@@ -103,6 +103,7 @@ export function Maps() {
   const [baseLayer, setBaseLayerState] = useState("satellite");
   const [active, setActive] = useState(() => new Set());
   const [panelOpen, setPanelOpen] = useState(false);
+
   const [query, setQuery] = useState("");
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState("");
@@ -148,14 +149,7 @@ export function Maps() {
 
   function ensureBaseLayer(id) {
     if (baseLayers.current[id]) return baseLayers.current[id];
-    const meta = BASE_LAYERS[id];
-    const tile = L.tileLayer(meta.url, {
-      attribution: meta.attribution,
-      maxNativeZoom: meta.maxNativeZoom,
-      maxZoom: meta.maxZoom,
-      updateWhenIdle: true,
-      keepBuffer: 1,
-    });
+    const tile = createBaseTileLayer(id, { updateWhenIdle: true, keepBuffer: 1 });
     baseLayers.current[id] = tile;
     return tile;
   }
@@ -433,6 +427,8 @@ export function Maps() {
     try {
       const imagery = await fetchLatestImagery(fieldId);
       setSelectedImagery(imagery);
+      const fieldBounds = cornersToLeafletBounds(imagery);
+      if (fieldBounds) prefetchMapArea(fieldBounds);
       setNdviStats(imagery.ndvi_stats ?? null);
       for (const layerId of ["rgb", "ndvi"]) {
         if (active.has(layerId))
@@ -2647,6 +2643,14 @@ export function Maps() {
           onBaseLayer={setBaseLayer}
           onToggleImagery={toggleImageryLayer}
           onToggleAnalysis={toggleAnalysisLayer}
+          getView={() => {
+            if (!map.current) return null;
+            const b = map.current.getBounds();
+            return {
+              bounds: { south: b.getSouth(), west: b.getWest(), north: b.getNorth(), east: b.getEast() },
+              zoom: map.current.getZoom(),
+            };
+          }}
         />
 
         {allChambersAssigned && (

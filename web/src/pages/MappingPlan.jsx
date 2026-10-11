@@ -11,7 +11,7 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import { BASE_LAYERS } from "@/components/maps/mapConfig";
+import { createBaseTileLayer, prefetchMapArea } from "@/components/maps/baseTiles";
 import { COVERAGE_PATH_STYLE, flagIcon } from "@/components/maps/flightPath";
 import { DEFAULT_CENTER, DEFAULT_ZOOM } from "@/lib/gcs/basemap";
 import { DroneTelemetryProvider } from "@/components/gcs/DroneTelemetryProvider";
@@ -323,8 +323,7 @@ export function MappingPlan() {
     const container = mapDiv.current;
     if (!container) return;
     const m = L.map(container, { zoomControl: true, maxZoom: 24, center: [DEFAULT_CENTER[1], DEFAULT_CENTER[0]], zoom: DEFAULT_ZOOM });
-    const sat = BASE_LAYERS.satellite;
-    L.tileLayer(sat.url, { attribution: sat.attribution, maxNativeZoom: sat.maxNativeZoom, maxZoom: sat.maxZoom }).addTo(m);
+    createBaseTileLayer("satellite").addTo(m);
     areasLayer.current = L.featureGroup().addTo(m);
     obstaclesLayer.current = L.layerGroup().addTo(m);
     capturedLayer.current = L.layerGroup().addTo(m); // under the path + live stations
@@ -362,6 +361,7 @@ export function MappingPlan() {
     if (areas.length || obstacles.length) return;
     seededView.current = true;
     map.current?.setView([displayLat, displayLng], 18);
+    prefetchMapArea([[displayLat, displayLng]]);
   }, [mapReady, droneAvailable, displayLat, displayLng, areas.length, obstacles.length]);
 
   // --- Resume mode: secured stations + fit --------------------------------------
@@ -390,6 +390,7 @@ export function MappingPlan() {
     fittedResumeId.current = id;
     seededView.current = true; // the survey, not a later drone fix, owns the view now
     m.fitBounds(L.latLngBounds(pts), { padding: [48, 48], maxZoom: 20 });
+    prefetchMapArea(pts);
   }, [resumeJob, mapReady]);
 
   // --- Map click delegation (append vertices / place circle) ------------------
@@ -424,10 +425,14 @@ export function MappingPlan() {
     const group = areasLayer.current;
     if (!group) return;
     group.clearLayers();
+    const pts = [];
     for (const a of areas) {
       if (a.ring.length < 3) continue;
-      L.polygon(a.ring.map((p) => [p.lat, p.lng]), { ...AREA_STYLE, interactive: false }).addTo(group);
+      const ring = a.ring.map((p) => [p.lat, p.lng]);
+      L.polygon(ring, { ...AREA_STYLE, interactive: false }).addTo(group);
+      pts.push(...ring);
     }
+    if (pts.length) prefetchMapArea(pts);
   }, [areas]);
 
   // --- Render obstacles ------------------------------------------------------

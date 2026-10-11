@@ -1,0 +1,15 @@
+# System service (root: restarts lightdm). Install:
+#   sudo cp deploy/rikub-display-watchdog.service /etc/systemd/system/ && sudo systemctl enable --now rikub-display-watchdog
+[Unit]
+Description=Jaga Padi: bring the touchscreen back if the desktop loses its output
+After=lightdm.service
+
+[Service]
+Type=simple
+ExecStart=/home/pi/rikub-project/deploy/display-watchdog.sh
+Restart=always
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=graphical.target

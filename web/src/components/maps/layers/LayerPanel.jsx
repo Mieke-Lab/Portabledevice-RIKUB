@@ -5,6 +5,8 @@ import {
   MAP_ANALYSIS_LAYERS,
   MAP_IMAGERY_LAYERS,
 } from "@/components/maps/mapConfig";
+import { OfflineMapPanel } from "@/components/maps/layers/OfflineMapPanel";
+
 
 export function LayerPanel({
   open,
@@ -17,6 +19,7 @@ export function LayerPanel({
   onBaseLayer,
   onToggleImagery,
   onToggleAnalysis,
+  getView,
 }) {
   return (
     <div className="absolute right-4 top-[188px] z-[1000] sm:top-[120px]">
@@ -30,7 +33,7 @@ export function LayerPanel({
         <Layers className="h-5 w-5" />
       </Button>
       {open && (
-        <div className="absolute right-[56px] top-0 w-[min(360px,calc(100vw-88px))] rounded-2xl bg-card p-3 shadow-soft animate-fade-up sm:p-3.5">
+        <div className="absolute right-[56px] top-0 max-h-[calc(100vh-140px)] w-[min(360px,calc(100vw-88px))] overflow-y-auto rounded-2xl bg-card p-3 shadow-soft animate-fade-up sm:p-3.5">
           <div className="mb-1.5 flex items-center justify-between gap-3">
             <div className="text-[14px] font-bold text-foreground">
               Map type
@@ -124,6 +127,10 @@ export function LayerPanel({
                 </span>
               </button>
             ))}
+          </div>
+
+          <div className="mt-2.5">
+            <OfflineMapPanel getView={getView} />
           </div>
         </div>
       )}

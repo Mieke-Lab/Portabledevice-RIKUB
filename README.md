@@ -135,6 +135,17 @@ curl http://localhost:8000/api/jobs/<session_id>/import                      # s
 ```
 
 - Kode: `server/app/map_import.py` (+ route di `routes/jobs.py`, `upsert_imagery_for_field` di `routes/fields.py`).
+- **Otomatis:** server memeriksa backend mapping tiap 60 detik dan langsung mengimpor
+  setiap sesi drone (yang punya blok `capture`) begitu berstatus `ready` dengan
+  `stitched.tif` + `ndvi.tif`, memakai nama area/sesi sebagai nama lahan. Gagal → dicoba
+  lagi setelah 10 menit. Tombol di halaman sesi tetap ada untuk memberi nama lahan
+  sendiri atau memperbarui.
+- Orthophoto **16-bit** dari stitcher di-stretch per band (persentil 2–98) ke 1..255;
+  piksel transparan (alpha 0) jadi nodata 0.
+- `clusters.kml` dari stitcher berisi koordinat **UTM** (melanggar standar KML); saat
+  impor ditulis ulang ke lon/lat memakai CRS orthophoto, jadi `zones.kml` di sistem ini
+  valid dan luas zonanya benar.
+- Konversi berjalan dengan nice 19 (catu daya Pi mudah undervoltage saat CPU penuh).
 - File disimpan di `storage/imagery/<lahan>/capture-<tanggal>-<id-sesi>/` sebagai
   `rgb.tif` (3 band **R, G, NIR** uint8, nodata 0 -- kamera RGN tidak punya band biru),
   `ndvi.tif` (float32, nodata -9999), `zones.kml`, dan `source.json`.

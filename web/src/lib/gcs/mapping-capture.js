@@ -56,6 +56,38 @@ export const MISSION_PHASE_LABEL = {
  *  they show up before the mission spins up. */
 export const MISSION_TERMINAL_PHASES = new Set(["complete", "done", "failed", "canceled", "paused", "interrupted"]);
 
+/** A leg is under way: the aircraft is (about to be) flying it or the backend is
+ *  still securing its frames. Both phase vocabularies. */
+const MAPPING_ACTIVE_PHASES = new Set(["arming", "armed", "capturing", "flying", "returning", "processing"]);
+export function isMappingLegActive(status) {
+  return status?.running === true || MAPPING_ACTIVE_PHASES.has(status?.phase);
+}
+
+const LIVE_PHASE_TO_STATE = { arming: "armed", capturing: "flying", complete: "done" };
+
+function sameSession(jobId, liveId) {
+  if (!jobId || !liveId) return false;
+  // the jobs service may prefix the pushed id with a timestamp ("20261011T162820_map-…")
+  return jobId === liveId || jobId.endsWith(`_${liveId}`) || liveId.endsWith(`_${jobId}`);
+}
+
+/**
+ * The session with its flight state taken from the drone's live leg
+ * (MappingMissionStatus) when that leg belongs to it. The persisted capture block
+ * can lag the aircraft — seen in the field: state still "armed" with 11 photos
+ * taken mid-flight, so the page offered "Lanjutkan Misi" over a running mission.
+ */
+export function withLiveLeg(job, live) {
+  const c = captureOf(job);
+  const liveId = live?.odm_job_id || live?.session_id;
+  if (!c || !live?.phase || live.phase === "idle" || !sameSession(job?.id || job?.job_id, liveId)) return job;
+  const state = LIVE_PHASE_TO_STATE[live.phase] ?? live.phase;
+  if (!CAPTURE_STATE_META[state]) return job;
+  const active = isMappingLegActive(live);
+  if (state === c.state && active === (c.active === true)) return job;
+  return { ...job, capture: { ...c, state, active } };
+}
+
 export function captureStateMeta(state) {
   return CAPTURE_STATE_META[state] ?? { label: state || "—", tone: "bg-muted text-muted-foreground", dot: "bg-slate-400", busy: false, resumable: false };
 }
