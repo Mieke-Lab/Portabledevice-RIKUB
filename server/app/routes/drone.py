@@ -1,5 +1,6 @@
 import math
 import os
+import re
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -175,6 +176,17 @@ def _optional_number(body: dict[str, Any], key: str, *, allow_zero: bool) -> flo
     return value
 
 
+def _optional_bool(body: dict[str, Any], key: str) -> bool | None:
+    """Pull an optional boolean, strictly: the backend does `bool(value)`, so a JSON
+    string "false" would silently read as True."""
+    value = body.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise HTTPException(status_code=400, detail=f"{key} must be true or false")
+    return value
+
+
 @router.post("/mapping-mission/pause")
 async def pause_mapping_mission(request: Request):
     """End the current mapping leg early (PauseMappingMission), keeping every
@@ -224,6 +236,65 @@ async def cancel_mapping_mission(request: Request):
     if body.get("session_id"):
         payload["session_id"] = body["session_id"]
     return await _call_grpc_in_threadpool(f"{DRONE}/CancelMappingMission", payload, 15, request)
+
+
+# `auto`, `wire`, `esp_wifi`, `wifi:<adapter>` or a bare adapter name (wlo1, wlx60e3270db1e6).
+_CAMERA_METHOD = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+
+
+@router.post("/camera/preflight")
+async def camera_preflight(request: Request):
+    """Which way will the next mapping photo be taken? (CameraPreflight.)
+
+    Probes every path to the camera — each PC Wi-Fi adapter, the ESP32's own Wi-Fi
+    and the PWM wire — and returns the working one: `{ok, method, via, verified,
+    wire_only, degraded, summary, fallbacks, warnings, error, paths[], camera{card,
+    free_pics, photo_count, ...}, cached, armed, elapsed_s}`. Never refuses: `ok:false`
+    means no path (or a camera that cannot shoot, e.g. no SD card) and is data, not
+    an HTTP error. `wire_only:true` means every wireless path is down and the next
+    photo goes over the unverifiable wire — the operator decides. Body (all
+    optional): `expected_shots` (int >= 0), `full` (also check SD card / free space,
+    default true), `heal` (re-join dropped adapters, default true). While the
+    vehicle is ARMED nothing is probed or repaired and the cached state comes back
+    (`cached:true`). Can take up to ~30 s. See docs/drone_api.md → Camera interface."""
+    body = await _read_json(request)
+    payload: dict[str, Any] = {}
+    expected = body.get("expected_shots")
+    if expected is not None:
+        if isinstance(expected, bool) or not isinstance(expected, int) or expected < 0:
+            raise HTTPException(status_code=400, detail="expected_shots must be a whole number >= 0")
+        payload["expected_shots"] = expected
+    for key in ("full", "heal"):
+        flag = _optional_bool(body, key)
+        if flag is not None:
+            payload[key] = flag
+    return await _call_grpc_in_threadpool(f"{DRONE}/CameraPreflight", payload, 70, request)
+
+
+@router.post("/camera/trigger")
+async def trigger_camera(request: Request):
+    """Fire the camera shutter once (TriggerCamera) — a REAL photo, for the operator's
+    bench checks. `method`: `auto` (default; exactly what a mission does), `wire` (the
+    PWM pulse: the camera should BEEP and its live view FREEZE for ~1 s — the only
+    proof a wire shot ever gets), `esp_wifi`, or `wifi:<adapter>` / `<adapter>`.
+    A named method fires only that path unless `fallback:true`. Returns `{ok, mode,
+    method, via, path, verified, files, elapsed_s, attempts[], skipped[], error, note,
+    hint?}`; `ok:false` is data, not an HTTP error. Refused with 409 while the vehicle
+    is armed, 400 for an unknown method."""
+    body = await _read_json(request)
+    method = body.get("method")
+    if method is None:
+        method = "auto"
+    if not isinstance(method, str) or not _CAMERA_METHOD.fullmatch(method.strip()):
+        raise HTTPException(
+            status_code=400,
+            detail="method must be 'auto', 'wire', 'esp_wifi' or a Wi-Fi adapter ('wifi:<iface>' or '<iface>')",
+        )
+    payload: dict[str, Any] = {"method": method.strip()}
+    fallback = _optional_bool(body, "fallback")
+    if fallback is not None:
+        payload["fallback"] = fallback
+    return await _call_grpc_in_threadpool(f"{DRONE}/TriggerCamera", payload, 75, request)
 
 
 @router.get("/spray/status")

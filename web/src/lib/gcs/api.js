@@ -216,6 +216,59 @@ export async function resumeMappingMission({ sessionId, altitude, holdTime } = {
 export const cancelMappingMission = (sessionId) =>
   postCommand("/api/drone/mapping-mission/cancel", sessionId ? { session_id: sessionId } : {});
 
+// --- Camera interface (see docs/drone_api.md → "Camera interface") ------------
+
+// POST with a deadline: a pre-flight probes every adapter and a trigger may fail over
+// down the whole path list, so these are slow (the BFF itself waits up to 70-75 s) —
+// without a deadline a dropped connection would leave the spinner up for ever.
+async function postCommandWithin(path, body, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await jsonOrThrow(
+      await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...droneAddrHeaders() },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      }),
+    );
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      const timeout = new Error("server tidak menjawab (waktu habis)");
+      timeout.status = 0;
+      throw timeout;
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Which way will the next mapping photo be taken? (CameraPreflight.) Probes every
+// path — each PC Wi-Fi adapter, the ESP32's own Wi-Fi, the PWM wire — and returns
+// { ok, method, via, verified, wire_only, degraded, summary, fallbacks[], warnings[],
+//   error, paths[], camera{card, free_pics, photo_count, …}, cached, armed }.
+// `ok:false` / `wire_only:true` are DATA, not errors. `heal` re-joins dropped adapters;
+// `full` also checks the SD card. While the vehicle is armed nothing is probed and the
+// cached state comes back (`cached:true`). Takes up to ~30 s.
+export const cameraPreflight = ({ expectedShots, full = true, heal = true } = {}) =>
+  postCommandWithin(
+    "/api/drone/camera/preflight",
+    { ...(expectedShots != null && { expected_shots: expectedShots }), full, heal },
+    90_000,
+  );
+
+// Fire the camera shutter once (TriggerCamera) — a REAL photo. `method`: "auto" (what a
+// mission does), "wire" (PWM pulse: the camera should BEEP and its live view FREEZE —
+// the only proof a wire shot gets), "esp_wifi", "wifi:<iface>". Refused (409) while armed.
+export const triggerCamera = ({ method = "auto", fallback } = {}) =>
+  postCommandWithin(
+    "/api/drone/camera/trigger",
+    { method, ...(fallback != null && { fallback }) },
+    90_000,
+  );
+
 // --- Reactive spraying (see docs/drone_api.md → "Spraying pipeline") ---------
 
 // Poll the reactive spray session. Pass the previous response's `next_seq` back

@@ -16,7 +16,9 @@ import { COVERAGE_PATH_STYLE, flagIcon } from "@/components/maps/flightPath";
 import { DEFAULT_CENTER, DEFAULT_ZOOM } from "@/lib/gcs/basemap";
 import { DroneTelemetryProvider } from "@/components/gcs/DroneTelemetryProvider";
 import { PreFlightAuditModal } from "@/components/gcs/PreFlightAuditModal";
-import { diagnosticsCoords, headingDeg, useDiagnostics } from "@/lib/gcs/diagnostics";
+import { CameraCheckBlock, CameraCheckDialog, needsAttention, useCameraCheck } from "@/components/gcs/CameraCheck";
+import { assessCamera } from "@/lib/gcs/camera-check";
+import { diagnosticsCoords, headingDeg, isStale, useDiagnostics } from "@/lib/gcs/diagnostics";
 import {
   pushCaptureMission, executeMission, fetchMappingMissionStatus, fetchJob,
   pauseMappingMission, resumeMappingMission, cancelMappingMission,
@@ -176,7 +178,7 @@ export function MappingPlan() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const resumeParam = searchParams.get("resume"); // /mapping/plan?resume=<sessionId>
-  const { data: diag } = useDiagnostics();
+  const { data: diag, updatedAt: diagAt } = useDiagnostics();
   const offset = useDroneOffset();
   const drone = diagnosticsCoords(diag); // raw {lat, lon}
   const displayDrone = applyOffsetToCoords(drone, offset); // {lat, lng} drift-corrected
@@ -209,6 +211,7 @@ export function MappingPlan() {
 
   // --- Launch / mission state ---
   const [showAudit, setShowAudit] = useState(false);
+  const [showCamera, setShowCamera] = useState(false); // the "Cek Kamera" decision dialog
   const [launching, setLaunching] = useState(false);
   // The session id is the mission id: PushCaptureMission creates the mapping
   // session under the id we pass, and every later call (ExecuteMission, GetJob,
@@ -686,7 +689,10 @@ export function MappingPlan() {
     try {
       // PushCaptureMission creates the mapping session under this id — it is in
       // GET /api/jobs (capture.state "armed") before the aircraft even arms.
-      await pushCaptureMission({ capturePoints: commandPoints, altitude, holdTime, sessionId: id });
+      const pushed = await pushCaptureMission({ capturePoints: commandPoints, altitude, holdTime, sessionId: id });
+      // The backend ran the camera pre-flight itself before accepting the plan (a wire-only camera
+      // passes — the operator decides): keep what it found, it is the freshest word on the camera.
+      camera.recordReport(pushed?.camera_check);
     } catch (e) {
       setLockedPlan(null); // nothing exists on the backend — the plan is editable again
       setError(e instanceof Error ? e.message : "Gagal mengunggah misi pemetaan");
@@ -742,7 +748,8 @@ export function MappingPlan() {
     // a drift recalibration mid-leg must not move the stations being flown.
     setLockedPlan(resumePlan);
     try {
-      await resumeMappingMission({ sessionId: id });
+      const resumed = await resumeMappingMission({ sessionId: id });
+      camera.recordReport(resumed?.camera_check);
       // Takeoff altitude is the leg's own (the session's) — the same value the
       // plan was just uploaded with.
       await executeMission({ mode: "mapping", altitude: c?.altitude ?? altitude, jobId: id });
@@ -853,6 +860,39 @@ export function MappingPlan() {
   const resumeProgress = resumeJob ? captureProgress(resumeJob) : null;
   const flightUiBusy = !!mission || resumePanel || resumeBlocked || resumeLoading;
 
+  // --- Camera pre-flight ("Cek Kamera") ---
+  // Which way will the photos be taken, and is it trustworthy? Only a Wi-Fi path can confirm a
+  // photo; the PWM wire fires blind. The live path states from Diagnostics back it up, so a camera
+  // that has gone wire-only is flagged even before anybody pressed the button.
+  const liveCamera = diag && !isStale(diagAt) ? diag.camera ?? null : null;
+  const camera = useCameraCheck({
+    expectedShots: resumePanel ? (resumeProgress?.remaining ?? 0) : photoCount,
+    live: liveCamera,
+    liveAt: liveCamera ? diagAt : null,
+  });
+  const cameraVerdict = camera.assessment;
+  // Whether the start button below is usable — the camera dialog's "Tetap terbang…" opens the same audit.
+  const canStart = resumePanel
+    ? !!resumeProgress?.remaining && !launching && !droneArmed
+    : !flightUiBusy && photoCount > 0 && !launching;
+  const cameraAudit = {
+    level: cameraVerdict.level,
+    title: cameraVerdict.title,
+    summary: cameraVerdict.summary,
+    lines: cameraVerdict.lines,
+    requireAck: cameraVerdict.requireAck,
+    ackLabel: cameraVerdict.ackLabel,
+    checking: camera.checking,
+    onCheck: () => camera.check(),
+  };
+  async function handleCameraCheck() {
+    const report = await camera.check();
+    if (!report) return; // the error is shown under the button
+    // A fresh result that needs a decision (wire only, no way to the camera) goes straight to the decision screen.
+    const verdict = assessCamera({ report, checkedAt: Date.now(), wireTest: camera.wireTest });
+    if (verdict.level === "danger" || verdict.level === "blocked" || verdict.level === "warn") setShowCamera(true);
+  }
+
   const inputCls = "w-full rounded-xl border border-border bg-card px-3 py-2 text-sm text-foreground outline-none focus:border-leaf focus:ring-2 focus:ring-leaf/20";
 
   return (
@@ -953,6 +993,7 @@ export function MappingPlan() {
                     onRetryExecute={handleRetryExecute}
                     onOpenSession={openSession}
                     onOpenList={() => navigate("/mapping")}
+                    cameraVerdict={cameraVerdict}
                   />
                 )
               ) : resumeJob ? (
@@ -1035,6 +1076,7 @@ export function MappingPlan() {
 
             {!drawing && resumePanel && (
               <div className="border-t border-border p-3">
+                <CameraCheckBlock camera={camera} droneArmed={droneArmed} onCheck={handleCameraCheck} onOpen={() => setShowCamera(true)} />
                 <Button variant="accent" className="w-full" disabled={!resumeProgress?.remaining || launching || droneArmed} onClick={() => setShowAudit(true)}>
                   {launching ? <><Loader2 className="h-4 w-4 animate-spin" /> Mengirim…</> : <><Play className="h-4 w-4" /> Lanjutkan Misi ({resumeProgress?.remaining ?? 0} foto)</>}
                 </Button>
@@ -1043,6 +1085,7 @@ export function MappingPlan() {
             )}
             {!drawing && !flightUiBusy && (
               <div className="border-t border-border p-3">
+                <CameraCheckBlock camera={camera} droneArmed={droneArmed} onCheck={handleCameraCheck} onOpen={() => setShowCamera(true)} />
                 <Button variant="accent" className="w-full" disabled={photoCount === 0 || launching} onClick={() => setShowAudit(true)}>
                   {launching ? <><Loader2 className="h-4 w-4 animate-spin" /> Mengirim…</> : <><Plane className="h-4 w-4" /> Terbangkan Misi ({photoCount} foto)</>}
                 </Button>
@@ -1056,8 +1099,18 @@ export function MappingPlan() {
       {/* BAYUCARAKA pre-flight audit (same gate as the spray planner) — gates a
           resumed leg exactly like a first launch. */}
       <div className="relative z-[2000] gcs-app">
-        <PreFlightAuditModal isOpen={showAudit} onClose={() => setShowAudit(false)} onExecute={resumePanel ? handleResume : handleLaunch} />
+        <PreFlightAuditModal
+          isOpen={showAudit} onClose={() => setShowAudit(false)}
+          onExecute={resumePanel ? handleResume : handleLaunch}
+          cameraCheck={cameraAudit}
+        />
       </div>
+
+      {/* Camera pre-flight: which path takes the photos, what is wrong, test the wire, or fly anyway. */}
+      <CameraCheckDialog
+        open={showCamera} onClose={() => setShowCamera(false)} camera={camera} droneArmed={droneArmed}
+        canProceed={canStart} onProceed={() => { setShowCamera(false); setShowAudit(true); }}
+      />
     </div>
   );
 }
@@ -1106,13 +1159,36 @@ function InlineConfirm({ text, note, yesLabel, yesIcon: YesIcon, destructive, bu
   );
 }
 
+// Camera trouble worth knowing about while the leg runs: photos that went over the blind
+// wire (nothing confirms them), points the camera could not be triggered for at all, and a
+// camera path picture that has gone bad. Silent while everything is verified.
+function CameraFlightNote({ mission, verdict }) {
+  const unverified = Array.isArray(mission?.unverified_points) ? mission.unverified_points.length : 0;
+  const skipped = Array.isArray(mission?.skipped_points) ? mission.skipped_points.length : 0;
+  const trouble = verdict && needsAttention(verdict.level);
+  if (!unverified && !skipped && !trouble) return null;
+  const bad = skipped > 0 || verdict?.level === "danger" || verdict?.level === "blocked";
+  return (
+    <div className={`flex flex-col gap-1 rounded-xl px-3 py-2 text-xs ${bad ? "bg-destructive/10 text-destructive" : "bg-amber-500/10 text-amber-900"}`}>
+      <p className="flex items-start gap-2 font-semibold">
+        <Camera className="mt-0.5 h-4 w-4 shrink-0" />
+        {trouble ? verdict.summary : "Kamera"}
+      </p>
+      {unverified > 0 && (
+        <p className="pl-6">{unverified} foto lewat kabel — tidak terverifikasi; dicocokkan dengan titik setelah mendarat, titik tanpa foto dibuang.</p>
+      )}
+      {skipped > 0 && <p className="pl-6">{skipped} titik dilewati — kamera tidak bisa dipicu sama sekali.</p>}
+    </div>
+  );
+}
+
 // Live flight view. `session` (GetJob) is preferred: its `capture` block is the
 // persisted truth and counts across legs. `captured` only advances when a leg is
 // processed on landing, so during the flight the bar shows photographed
 // (captured + pending) — what the operator sees the drone doing. `mission`
 // (MappingMissionStatus) is the per-leg live view and the fallback when the
 // session poll fails.
-function MissionProgress({ mission, session, pausing, confirm, acting, launchError, onConfirm, onPause, onCancel, onRetryExecute, onOpenSession, onOpenList }) {
+function MissionProgress({ mission, session, pausing, confirm, acting, launchError, onConfirm, onPause, onCancel, onRetryExecute, onOpenSession, onOpenList, cameraVerdict }) {
   const c = captureOf(session);
   const prog = c ? captureProgress(session) : null;
   const total = prog ? prog.total : mission.total_captures || 0;
@@ -1188,6 +1264,8 @@ function MissionProgress({ mission, session, pausing, confirm, acting, launchErr
       )}
 
       {lastError && <ErrorNote>{lastError}</ErrorNote>}
+
+      <CameraFlightNote mission={mission} verdict={cameraVerdict} />
 
       {/* Uploaded but never took off: the session is still `armed` under this id,
           so the one-tap way out is to re-Execute it (a fresh push would 409).

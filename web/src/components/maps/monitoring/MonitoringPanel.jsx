@@ -90,6 +90,8 @@ function MappingCard({ status, job }) {
   const session = captureProgress(job); // across legs: secured vs photographed-not-yet-secured
   const leg = status?.leg ?? job?.capture?.leg;
   const trigger = status?.last_trigger;
+  const unverified = Array.isArray(status?.unverified_points) ? status.unverified_points.length : 0;
+  const skipped = Array.isArray(status?.skipped_points) ? status.skipped_points.length : 0;
   const error = status?.last_error || job?.capture?.last_error || "";
   return (
     <div className="rounded-xl border border-white/10 bg-white/5 p-2.5">
@@ -113,6 +115,17 @@ function MappingCard({ status, job }) {
       {trigger?.ok === false && (
         <div className="mt-1.5 text-[10px] font-semibold text-amber-300">
           Pemicu kamera gagal: {trigger.error || "tanpa keterangan"}
+        </div>
+      )}
+      {/* Photos over the blind PWM wire can't be confirmed; points no path could shoot are dropped. */}
+      {unverified > 0 && (
+        <div className="mt-1.5 text-[10px] font-semibold text-amber-300">
+          {unverified} foto lewat kabel — tidak terverifikasi
+        </div>
+      )}
+      {skipped > 0 && (
+        <div className="mt-1.5 text-[10px] font-semibold text-rose-300">
+          {skipped} titik dilewati — kamera tidak terpicu
         </div>
       )}
       {error && <div className="mt-1.5 text-[10px] font-semibold text-rose-300">{error}</div>}

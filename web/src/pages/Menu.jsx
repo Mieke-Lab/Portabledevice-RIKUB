@@ -78,25 +78,25 @@ const ACCENTS = {
 const CARDS = [
   {
     to: '/maps', featured: true, accent: 'forest', Icon: MapPinned, tag: 'Monitoring GIS',
-    cover: '/data/cover/gis_new.png', objPos: '50% 42%', title: 'SmartGIS', subtitle: 'Peta Interaktif', online: true,
+    cover: '/data/cover/gis_new.png', objPos: '50% 42%', title: 'SmartGIS', subtitle: 'Peta Interaktif',
     desc: 'Pantau sawah dengan overlay GIS & citra real-time. Telusuri koordinat, layer lahan, dan titik foto lapangan.',
     stats: [{ Icon: Layers, label: '5 layer' }, { Icon: ImageIcon, label: '12 titik foto' }],
   },
   {
     to: '/mapping', accent: 'uplift', Icon: MapIcon, tag: 'Fotogrametri',
-    coverGradient: 'from-forest to-uplift', title: 'Pemetaan Lahan', online: true,
+    coverGradient: 'from-forest to-uplift', title: 'Pemetaan Lahan',
   },
   {
     to: '/monitoring', accent: 'monitor', Icon: Radar, tag: 'Telemetry Live',
-    cover: '/data/cover/gis.jpg', objPos: '50% 55%', title: 'Monitoring Drone', online: true,
+    cover: '/data/cover/gis.jpg', objPos: '50% 55%', title: 'Monitoring Drone',
   },
   {
     to: '/chatbot', accent: 'leaf', Icon: Bot, tag: 'Asisten AI',
-    cover: '/data/cover/chatbot.jpg', objPos: '72% 26%', title: 'Chatbot AI', online: true,
+    cover: '/data/cover/chatbot.jpg', objPos: '72% 26%', title: 'Chatbot AI',
   },
   {
     to: '/detection', accent: 'harvest', Icon: ScanSearch, tag: 'Computer Vision',
-    cover: '/data/cover/detection.jpg', objPos: '50% 45%', title: 'Deteksi Penyakit', online: true,
+    cover: '/data/cover/detection.jpg', objPos: '50% 45%', title: 'Deteksi Penyakit',
   },
 ];
 
@@ -122,10 +122,6 @@ function FeatureCard({ card }) {
           <Badge variant="outline" className="absolute right-4 top-4 border-transparent px-3 py-1 text-[10px] font-bold uppercase tracking-[0.15em] backdrop-blur-md shadow-sm bg-slate-900/85 text-white">
             {card.tag}
           </Badge>
-          <span className="absolute left-4 top-4 inline-flex items-center gap-1.5 rounded-full bg-white/95 px-3 py-1.5 text-[10px] font-bold uppercase tracking-widest shadow-sm backdrop-blur-md text-emerald-700">
-            <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
-            {card.online ? 'online' : 'offline'}
-          </span>
         </div>
 
         <div className="flex shrink-0 flex-col gap-2 p-4">
@@ -179,12 +175,7 @@ function FeatureCard({ card }) {
             <Icon className="h-14 w-14 text-white/85" strokeWidth={1.3} />
           </div>
         )}
-        {/* No tag badge here: at kiosk width (~180px per card) it collided with
-            the online pill and covered the picture. */}
-        <span className={`absolute left-3 top-3 inline-flex items-center gap-1.5 rounded-full bg-white/90 px-2.5 py-1 text-xs font-semibold backdrop-blur-sm ${card.online ? 'text-leaf' : 'text-slate-500'}`}>
-          <span className={`h-2 w-2 rounded-full ${card.online ? 'bg-leaf' : 'bg-slate-300'}`} />
-          {card.online ? 'online' : 'offline'}
-        </span>
+        {/* No tag badge here: at kiosk width (~180px per card) it would cover the picture. */}
       </div>
 
       {/* Title strip only — the kiosk screen is small, so the cover picture gets

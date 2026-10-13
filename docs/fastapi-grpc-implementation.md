@@ -183,6 +183,8 @@ GET  /api/drone/mapping-mission
 POST /api/drone/mapping-mission/pause
 POST /api/drone/mapping-mission/resume
 POST /api/drone/mapping-mission/cancel
+POST /api/drone/camera/preflight
+POST /api/drone/camera/trigger
 ```
 
 Mapping ke gRPC:
@@ -204,11 +206,19 @@ Mapping ke gRPC:
 | `POST /mapping-mission/pause` | `/soerogis.DroneService/PauseMappingMission` |
 | `POST /mapping-mission/resume` | `/soerogis.DroneService/ResumeMappingMission` |
 | `POST /mapping-mission/cancel` | `/soerogis.DroneService/CancelMappingMission` |
+| `POST /camera/preflight` | `/soerogis.DroneService/CameraPreflight` |
+| `POST /camera/trigger` | `/soerogis.DroneService/TriggerCamera` |
 
 Route `mapping-mission/*` mengelola misi pemetaan per-leg (push → pause → resume,
 atau cancel). Body `resume` wajib `session_id`; `altitude`/`hold_time` opsional dan
 hanya diteruskan kalau ada. Kontrak lengkap (termasuk blok `capture` di sesi) ada
 di `docs/drone_api.md` bagian "Mapping capture mission" dan `docs/mapping.md`.
+
+Route `camera/preflight` memeriksa semua jalur ke kamera (Wi-Fi tiap adaptor, Wi-Fi ESP32, kabel PWM, kartu SD)
+dan `camera/trigger` memotret **sungguhan** satu kali (uji kabel; ditolak 409 saat drone ARMED). Body divalidasi di
+BFF (`expected_shots` bilangan bulat >= 0, `full`/`heal`/`fallback` harus boolean asli, `method` hanya
+`auto`/`wire`/`esp_wifi`/`wifi:<iface>`). Hasil `ok:false` atau `wire_only:true` adalah data, bukan error HTTP.
+Kontraknya ada di `docs/drone_api.md` bagian "Camera pre-flight".
 
 Contoh route:
 

@@ -516,10 +516,63 @@ HTTP **409**, `NOT_FOUND` as **404**, `INVALID_ARGUMENT` as **400**; the
 | `POST /api/drone/mapping-mission/resume` | `ResumeMappingMission` | Body `{session_id, altitude?, hold_time?}` (`job_id` accepted as alias). `400` when `session_id` is missing, or `altitude` / `hold_time` is not a finite number (`altitude > 0`, `hold_time >= 0`; bools rejected). Optional keys are forwarded only when present and non-null. Timeout 70 s (it uploads a plan). |
 | `POST /api/drone/mapping-mission/cancel` | `CancelMappingMission` | Body `{}` or `{session_id}`; `session_id` is forwarded only when given. |
 | `POST /api/drone/mission/execute` | `ExecuteMission` | `{mode: "mapping", job_id: session_id}` flies the leg (first or resumed). |
+| `POST /api/drone/camera/preflight` | `CameraPreflight` | Body (all optional) `{expected_shots?, full?, heal?}`: `expected_shots` a whole number `>= 0`, `full` / `heal` real booleans (`400` otherwise — the backend would read the string `"false"` as true). `ok:false` / `wire_only:true` are **data**, not HTTP errors. Takes up to ~30 s, timeout 70 s. See [Camera pre-flight](#camera-pre-flight). |
+| `POST /api/drone/camera/trigger` | `TriggerCamera` | Body `{method?, fallback?}`; `method` is `auto` (default), `wire`, `esp_wifi`, `wifi:<iface>` or a bare adapter name (`400` for anything else, also for an unknown name from the backend). Takes a **real photo**; `409` while the vehicle is armed. Timeout 75 s. |
 | `GET /api/jobs?capture_only=true` | `ListJobs {capture_only: true}` | Plain array of session objects. `capture_only` is forwarded only when true (default request stays `{}`). |
 | `GET /api/jobs/{id}` | `GetJob` | Session object: the `capture` block passes through untouched; `artifacts` (`raw_dir`, `stitched_tif`, `clusters_kml`, `processed_dir`) are rewritten to a browser-reachable host. |
 | `POST /api/jobs/{id}/cancel` | `CancelJob` | Optional JSON body `{force: true}`; `force` is forwarded only when it is JSON `true` (`400` if present and not a boolean; `null` = absent). `409` while `capture.active` without it. |
 | `DELETE /api/jobs/{id}?force=true` | `RemoveJob` | `force` is sent only when the query flag is set. `409` without it while `capture.active`, or when `capture.captured` is non-empty (the frames are the only copy). |
+
+### Camera pre-flight
+
+The backend takes every mapping photo over the **first path that works**: each PC Wi-Fi adapter
+(`wifi:<iface>`), the ESP32's own Wi-Fi (`esp_wifi`) and, as the last resort, the PWM wire (`wire`). Only the
+Wi-Fi paths can *prove* a photo was taken (they check the camera's photo list); the wire fires blind — the only
+evidence is the camera's own beep. `PushCaptureMission` / `ResumeMappingMission` run the same pre-flight
+themselves and return it as **`camera_check`**: a wire-only camera passes (the operator decides), no path at all
+or a camera that cannot shoot (no SD card, card full) is refused (`409`).
+
+`POST /api/drone/camera/preflight` returns
+`{ok, mode, method, via, verified, wire_only, degraded, fallbacks[], summary, warnings[], error, paths[], camera, cached, armed, elapsed_s}`:
+
+* `paths[]` — one entry per path: `{name, kind: wifi|esp_wifi|wire, state, usable, verified, error, latency_ms, iface?, blocked_by?, esp?}`.
+  `state` is `ready`, `degraded` (answers slowly), `down`, `blocked` (the adapter carries another network —
+  `blocked_by`; by design it is not taken over, e.g. the bench's uplink SSIDs), `missing`, `unsupported`,
+  `unverifiable` (the wire) or `unknown`.
+* `method` — the path the next photo tries first (`null` when `ok` is false). **`wire_only: true`** means every
+  wireless path is down: photos are not verified and the SD card / free space could not be checked
+  (`camera` is `null`). `ok: false` with `camera` set means the camera is reachable but cannot shoot.
+* `camera` — `{ok, card, free_pics, photo_count, listing_s, warnings}` when a Wi-Fi path could ask the camera.
+* While the vehicle is **armed** nothing is probed and the cached state comes back (`cached: true`).
+* The same `method` + `paths[]` are live in `Diagnostics.camera` (kept fresh by the backend's own monitor), and
+  `MappingMissionStatus` reports `unverified_points` (shots that went over the wire), `skipped_points` and
+  `last_trigger` while a leg runs.
+
+**Planner UI** (`web/src/pages/MappingPlan.jsx`, `web/src/components/gcs/CameraCheck.jsx`, the decisions in
+`web/src/lib/gcs/camera-check.js`): a **Cek Kamera** button sits directly above *Terbangkan Misi* /
+*Lanjutkan Misi*. It runs the pre-flight and shows one verdict line; tapping it opens the dialog (path list with
+what each state means, SD card, *Uji Kabel*, *Cek Ulang*, and for a wire-only camera *Tetap terbang…* which opens
+the usual pre-flight audit). The pre-flight audit (3 checks + slide) shows the same verdict as a banner:
+
+| Level | When | What the operator gets |
+|-------|------|------------------------|
+| `ok` | a Wi-Fi path works, nothing wrong | green line: *Foto terverifikasi lewat …* |
+| `caution` | works, but a path is down / slow, or the card has a note (many old files) | amber line, details in the dialog |
+| `warn` | wire only, **hand-tested** (beep heard) | orange; no extra confirmation |
+| `danger` | wire only and untested / failed the test, or the legacy `esp` interface | red; the audit modal adds a **required acknowledgement** before the slider unlocks |
+| `blocked` | `ok: false` (no path, no SD card, card full) | red; the audit says the server will refuse the mission |
+| `unknown` | never checked, or the check is older than 5 min and there is no live data | grey hint to press *Cek Kamera* |
+
+The live `Diagnostics.camera` view is used before anybody pressed the button and when the last check is old; a
+newer live picture that is *worse* than a fresh check overrides it. A mission already flying shows a note in its
+panel (and in the monitoring card) for every photo that went over the wire and every point the camera could not
+be triggered for.
+
+**Testing the wire by hand** — *Uji Kabel* sends `{"method": "wire"}`, which **takes a real photo**: the camera
+should beep and its live view freeze for about a second; the operator confirms what they heard and the result
+is remembered (per drone address, one hour). The test photo stays on the SD card and is downloaded after landing —
+the backend pairs frames to points by name / capture time when the counts differ, but positionally when they are
+equal, so empty the card before a wire-only mission if you can.
 
 ---
 

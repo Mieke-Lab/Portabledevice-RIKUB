@@ -19,8 +19,15 @@ Run against the BFF (from the repo root; the env var beats server/.env):
     server/venv/bin/python server/scripts/fake_soerogis.py --autofly
     cd server && BACKEND_GRPC_ADDR=127.0.0.1:50052 ./venv/bin/uvicorn main:app --port 8000
 
+It also fakes the camera interface (CameraPreflight / TriggerCamera + the `camera`
+section of Diagnostics, docs/drone_api.md → Camera interface) in switchable
+scenarios — verified · degraded · wire_only · no_path · no_sd · slow_card · esp_mode ·
+error — so the planner's "Cek Kamera" can be exercised in every state. Pick one with
+--camera, or flip it live with the fake-only RPC `FakeCameraScenario {"name": ...}`.
+
 Flags: --port 50052 · --http-port 8765 · --tick 1.5 (seconds per photo) ·
-       --autofly (start a live flight at boot) · --no-seed (empty registry).
+       --autofly (start a live flight at boot) · --no-seed (empty registry) ·
+       --camera verified (camera scenario) · --camera-delay 1.5 (seconds a pre-flight takes).
 """
 import argparse
 import json
@@ -47,6 +54,8 @@ RETURN_SECS, PROCESS_SECS, STITCH_SECS, CLUSTER_SECS = 3.0, 3.0, 20.0, 3.0
 FAILED_PRECONDITION, NOT_FOUND, INVALID = (grpc.StatusCode.FAILED_PRECONDITION, grpc.StatusCode.NOT_FOUND,
                                            grpc.StatusCode.INVALID_ARGUMENT)
 SHUTDOWN = threading.Event()
+CAMERA_SCENARIOS = ("verified", "degraded", "wire_only", "no_path", "no_sd", "slow_card", "esp_mode", "error")
+CAMERA_SSID = "MAPIR-S3WRGN-dbd530"
 
 
 def now_iso():
@@ -100,6 +109,9 @@ class Backend:
         self.last_leg = None  # what MappingMissionStatus keeps reporting once a leg settled
         self.drone = {"armed": False, "mode": "GUIDED", "lat": HOME[0], "lng": HOME[1], "alt": 0.0,
                       "heading": 90.0, "job_id": "idle", "mission_running": False, "last_command": "", "last_error": ""}
+        self.camera_scenario, self.camera_delay = "verified", 1.5
+        self.camera_last_preflight, self.camera_last_trigger = None, None
+        self.camera_totals = {"wifi": 0, "esp_wifi": 0, "wire": 0, "esp": 0, "skipped": 0}
 
     # ---- sessions -----------------------------------------------------------
     def new_session(self, sid, name="", area_name="", captured_at="", capture=None, **over):
@@ -251,6 +263,9 @@ class Backend:
         return {"running": self.leg is not None and bool(cap.get("active")),
                 "session_id": leg.sid if leg else "", "phase": cap.get("state") or "idle",
                 "captures_done": leg.done if leg else 0, "total_captures": len(leg.plan) if leg else 0,
+                # the wire's shots are never confirmed: in the wire_only scenario every shot taken is unverified
+                "unverified_points": list(leg.plan[:leg.done]) if leg and self.camera_scenario == "wire_only" else [],
+                "skipped_points": [], "last_trigger": self.camera_last_trigger,
                 "odm_job_id": leg.sid if leg else "", "last_error": cap.get("last_error", "")}
 
     def mapping_reply(self, command):
@@ -269,7 +284,165 @@ class Backend:
                             "lon": int(d["lng"] * 1e7), "alt": int((12.0 + d["alt"]) * 1000), "eph": 80, "epv": 120,
                             "vel": 350 if d["mission_running"] else 0, "cog": int(d["heading"] * 100),
                             "yaw": int(d["heading"] * 100) or 36000},
-                "flow": None, "spray": None}
+                "flow": None, "spray": None, "camera": self.camera_diagnostics()}
+
+    # ---- camera (docs/drone_api.md → Camera interface) ---------------------------------
+    @staticmethod
+    def _path(name, kind, state, **extra):
+        base = {"name": name, "kind": kind, "state": state, "usable": state in ("ready", "degraded", "unverifiable"),
+                "verified": kind != "wire", "error": None, "latency_ms": None, "priority": 0, "shots_ok": 0,
+                "shots_failed": 0, "consecutive_failures": 0, "cooldown_s": 0, "heals": 0}
+        base.update(extra)
+        return base
+
+    def camera_paths(self):
+        """The five paths in the state the current scenario puts them in (ordered like the real backend)."""
+        sc, P = self.camera_scenario, self._path
+        if sc == "esp_mode":
+            return []
+        down = f"not joined to {CAMERA_SSID}"
+        blocked = P("wifi:wlxe84e06b03d50", "wifi", "blocked", iface="wlxe84e06b03d50", blocked_by="C Yerosaka",
+                    error="wlxe84e06b03d50 is on 'C Yerosaka', a protected network (SOEROGIS_CAMERA_WIFI_PROTECTED_SSIDS); "
+                          "the camera link never takes it over")
+        esp = {"state": "connected", "rssi": -57, "ip": "192.168.1.34", "ssid": CAMERA_SSID, "cam": "ok", "fw": 2}
+        wire = P("wire", "wire", "unverifiable")
+        if sc in ("verified", "no_sd", "slow_card", "error"):
+            return [blocked, P("wifi:wlo1", "wifi", "ready", iface="wlo1", latency_ms=11),
+                    P("wifi:wlx60e3270db1e6", "wifi", "ready", iface="wlx60e3270db1e6", latency_ms=36),
+                    P("esp_wifi", "esp_wifi", "ready", latency_ms=170, esp=esp), wire]
+        if sc == "degraded":
+            return [blocked, P("wifi:wlo1", "wifi", "down", iface="wlo1", error=f"wlo1 is {down}"),
+                    P("wifi:wlx60e3270db1e6", "wifi", "degraded", iface="wlx60e3270db1e6", latency_ms=3800),
+                    P("esp_wifi", "esp_wifi", "ready", latency_ms=170, esp=esp), wire]
+        gone = {**esp, "state": "no_ap", "cam": "-", "ip": ""}
+        if sc == "wire_only":
+            return [blocked, P("wifi:wlo1", "wifi", "down", iface="wlo1", error=f"wlo1 is {down}"),
+                    P("wifi:wlx60e3270db1e6", "wifi", "down", iface="wlx60e3270db1e6", error="the camera did not answer its heartbeat"),
+                    P("esp_wifi", "esp_wifi", "down", esp=gone, error="the ESP is not connected to the camera's WiFi"), wire]
+        # no_path: even the wire is gone (ESP serial down)
+        return [blocked, P("wifi:wlo1", "wifi", "down", iface="wlo1", error=f"wlo1 is {down}"),
+                P("wifi:wlx60e3270db1e6", "wifi", "missing", iface="wlx60e3270db1e6", error="adapter wlx60e3270db1e6 is not present"),
+                P("esp_wifi", "esp_wifi", "down", error="the ESP is not connected to this PC (serial down)"),
+                P("wire", "wire", "down", error="the ESP is not connected to this PC (serial down)")]
+
+    def camera_method(self):
+        paths = [p for p in self.camera_paths() if p["usable"]]
+        ready = [p for p in paths if p["verified"] and p["state"] == "ready"] or [p for p in paths if p["verified"]]
+        return ready[0]["name"] if ready else ("wire" if any(p["name"] == "wire" for p in paths) else None)
+
+    def camera_diagnostics(self):
+        if self.camera_scenario == "esp_mode":
+            return {"mode": "esp", "method": "esp", "active": None, "paths": [], "last_preflight": self.camera_last_preflight,
+                    "last_trigger": self.camera_last_trigger, "totals": dict(self.camera_totals)}
+        return {"mode": "wifi", "method": self.camera_method(), "active": None, "paths": self.camera_paths(),
+                "wifi": {"ssid": CAMERA_SSID, "host": "192.168.1.254", "iface": "wlo1", "manage_link": True},
+                "last_preflight": self.camera_last_preflight, "last_trigger": self.camera_last_trigger,
+                "totals": dict(self.camera_totals)}
+
+    def camera_gate(self, when, expected_shots):
+        """What PushCaptureMission / ResumeMappingMission do first: run the pre-flight, refuse when it says no
+        (a wire-only camera passes — the operator decides), and hand the report back as `camera_check`."""
+        delay, self.camera_delay = self.camera_delay, 0.0
+        try:
+            report = self.CameraPreflight({"expected_shots": expected_shots})
+        finally:
+            self.camera_delay = delay
+        if not report.get("ok"):
+            raise RpcFail(FAILED_PRECONDITION, f"{when} camera check failed: {report.get('error')}")
+        return report
+
+    def CameraPreflight(self, p):
+        sc = self.camera_scenario
+        time.sleep(max(0.0, self.camera_delay))  # a real one probes every adapter: seconds
+        armed = bool(self.drone["armed"])
+        if sc == "error":
+            raise RpcFail(grpc.StatusCode.INTERNAL, "CameraPreflight crashed: simulated failure")
+        if sc == "esp_mode":
+            return {"ok": True, "mode": "esp", "error": None, "method": "esp", "verified": False, "wire_only": True,
+                    "warnings": [], "paths": [], "cached": armed, "armed": armed}
+        paths, method = self.camera_paths(), self.camera_method()
+        warnings, error, camera = [], None, None
+        files = int(p.get("expected_shots") or 0)
+        if method not in (None, "wire"):
+            camera = {"ok": True, "retryable": False, "error": None, "warnings": [], "heartbeat": True, "photo_count": 0,
+                      "listing_s": 0.21, "projected_listing_s": 0.3, "card": 1, "free_pics": 812}
+            if sc == "slow_card":
+                camera.update(photo_count=412, listing_s=1.9, projected_listing_s=3.1, warnings=[
+                    f"412 files on the card (+{2 * files} from this mission): the photo listing will take ~3.1s by the end, "
+                    "so each shot takes that much longer to confirm. Consider draining the card first (drain_sd=true)."])
+                warnings += camera["warnings"]
+            elif sc == "no_sd":
+                camera.update(ok=False, card=0, free_pics=None, error="the camera reports NO SD CARD")
+                error, method = camera["error"], None
+        if method == "wire":
+            warnings.append("only the WIRE is available: no WiFi path reaches the camera, so shots cannot be verified and "
+                            "the SD card / free space could not be checked. Trigger the camera by hand "
+                            "(TriggerCamera method=wire) and listen for the shutter beep before relying on it.")
+        elif method is None and error is None:
+            error = "no way to reach the camera — " + "; ".join(f"{q['name']}: {q['error'] or q['state']}" for q in paths)
+        report = {
+            "ok": error is None and method is not None, "mode": "wifi", "method": method,
+            "via": next((q["kind"] for q in paths if q["name"] == method), None),
+            "verified": bool(method and method != "wire"), "wire_only": method == "wire",
+            "degraded": any(q["state"] in ("down", "missing", "unsupported", "degraded") for q in paths),
+            "summary": f"next shot via {method}" if method else "NO path to the camera",
+            "fallbacks": [q["name"] for q in paths if q["usable"] and q["name"] != method],
+            "warnings": warnings, "error": error, "paths": paths, "link": None, "camera": camera,
+            "camera_via": method if camera else None, "cached": armed, "armed": armed,
+            "elapsed_s": round(self.camera_delay, 2), "at": time.time()}
+        self.camera_last_preflight = {k: report[k] for k in ("ok", "method", "verified", "wire_only", "error", "at")}
+        return report
+
+    def TriggerCamera(self, p):
+        if self.drone["armed"]:
+            raise RpcFail(FAILED_PRECONDITION, "TriggerCamera refused: the vehicle is ARMED (camera USB ops are ground-only)")
+        method = str(p.get("method") or "auto").strip().lower()
+        esp_mode = self.camera_scenario == "esp_mode"  # the legacy blind pulse: only auto / wire / esp exist
+        by_name = {q["name"]: q for q in self.camera_paths()}
+        iface = {name.split(":", 1)[1]: name for name, q in by_name.items() if q["kind"] == "wifi"}
+        method = iface.get(method, method)
+        if method not in set(by_name) | {"auto"} | ({"wire", "esp"} if esp_mode else set()):
+            raise RpcFail(INVALID, f"unknown camera method {method!r}")
+        time.sleep(0.9)  # the 2000 us pulse + the camera's own ~1 s of shutter
+        path = "esp" if esp_mode else (self.camera_method() if method == "auto" else method)
+        usable = path == "esp" or (path in by_name and by_name[path]["usable"])
+        if method == "auto" and self.camera_scenario in ("no_sd", "no_path"):
+            out = {"ok": False, "mode": "wifi", "method": "auto", "via": None, "path": None, "verified": False, "files": [],
+                   "attempts": [], "skipped": [], "error": "no way to reach the camera", "note": ""}
+            self.camera_totals["skipped"] += 1
+        elif not usable:
+            out = {"ok": False, "mode": "wifi", "method": method, "via": None, "path": None, "verified": False, "files": [],
+                   "elapsed_s": 0.9, "attempts": [{"via": path, "path": path, "ok": False, "error": by_name[path]["error"]}],
+                   "skipped": [], "error": by_name[path]["error"] or f"{path} is {by_name[path]['state']}", "note": ""}
+            self.camera_totals["skipped"] += 1
+        else:
+            kind = "wire" if path in ("wire", "esp") else ("esp_wifi" if path == "esp_wifi" else "wifi")
+            verified = kind != "wire"
+            files = [f"DCIM__PHOTO__2026_1013_{time.strftime('%H%M%S')}.RAW"] if verified else []
+            out = {"ok": True, "mode": "wifi", "method": method, "via": kind, "path": path, "verified": verified, "files": files,
+                   "elapsed_s": 0.9, "attempts": [{"via": kind, "path": path, "ok": True, "verified": verified}],
+                   "skipped": [], "error": "", "note": ""}
+            if not verified:
+                out["hint"] = ("The wire pulse was sent (2000 us on the camera's HDMI PWM pin). Nothing can confirm a photo over it: "
+                               "the camera should BEEP and its live view should FREEZE for about a second. If it did not, do not rely on the wire.")
+            self.camera_totals[kind] += 1
+        self.camera_last_trigger = {**out, "at": time.time()}
+        return out
+
+    def FakeCameraScenario(self, p):
+        """Fake-only: flip the camera scenario while running (the real backend has no such RPC)."""
+        name = p.get("name") or p.get("scenario")
+        if name not in CAMERA_SCENARIOS:
+            raise RpcFail(INVALID, f"scenario must be one of {', '.join(CAMERA_SCENARIOS)}")
+        self.camera_scenario = name
+        if p.get("delay") is not None:
+            self.camera_delay = float(p["delay"])
+        return {"scenario": name, "delay": self.camera_delay}
+
+    def FakeSetArmed(self, p):
+        """Fake-only: arm/disarm the simulated aircraft without flying (to test the armed-camera behaviour)."""
+        self.drone["armed"] = bool(p.get("armed"))
+        return {"armed": self.drone["armed"]}
 
     def PushCaptureMission(self, p):
         points = [{"lat": float(q["lat"]), "lng": float(q["lng"])} for q in p.get("capture_points") or []]
@@ -280,12 +453,13 @@ class Backend:
         sid = p.get("session_id") or p.get("job_id") or f"map-{uuid.uuid4().hex[:8]}"
         if sid in self.sessions:
             raise RpcFail(FAILED_PRECONDITION, f"session {sid} already exists")
+        camera_check = self.camera_gate("pre-flight", len(points))
         self.new_session(sid, capture={
             "state": "armed", "active": True, "points": points, "captured": [], "pending": [],
             "altitude": float(p.get("altitude") or 5.0), "hold_time": float(p.get("hold_time") or 0.0),
             "final_action": "rtl", "leg": 1, "last_error": "", "updated_at": now_iso()})
         self.leg = Leg(sid, list(range(len(points))))
-        return {**self.mapping_reply("push_capture_mission"), "session_id": sid}
+        return {**self.mapping_reply("push_capture_mission"), "session_id": sid, "camera_check": camera_check}
 
     def ExecuteMission(self, p):
         sid = p.get("job_id") or p.get("session_id") or ""
@@ -329,6 +503,7 @@ class Backend:
         remaining = [i for i in range(len(cap["points"])) if i not in cap["captured"]]
         if not remaining:
             raise RpcFail(FAILED_PRECONDITION, "nothing left to fly")
+        camera_check = self.camera_gate("pre-resume", len(remaining))
         # Pending points of a failed leg are re-flown, not left as holes: they
         # stay listed ("stays here", docs/mapping.md) until the resumed leg
         # re-secures them, so the photographed tally never goes backwards.
@@ -339,7 +514,7 @@ class Backend:
                    hold_time=float(p["hold_time"]) if p.get("hold_time") is not None else cap["hold_time"])
         self.touch(s)
         self.leg = Leg(s["id"], remaining)
-        return {**self.mapping_reply("resume_mapping_mission"), "session_id": s["id"]}
+        return {**self.mapping_reply("resume_mapping_mission"), "session_id": s["id"], "camera_check": camera_check}
 
     def CancelMappingMission(self, p):
         leg = self.leg
@@ -483,7 +658,8 @@ class JsonHandler(grpc.GenericRpcHandler):
                                        "CancelJob", "RemoveJob"},
         "soerogis.DroneService": {"Diagnostics", "MissionStatus", "PushCaptureMission", "ExecuteMission",
                                   "MappingMissionStatus", "PauseMappingMission", "ResumeMappingMission",
-                                  "CancelMappingMission", "Arm", "Disarm", "Takeoff", "Land", "SetMode", "PushMission"},
+                                  "CancelMappingMission", "Arm", "Disarm", "Takeoff", "Land", "SetMode", "PushMission",
+                                  "CameraPreflight", "TriggerCamera", "FakeCameraScenario", "FakeSetArmed"},
     }
     # Polls arrive every second or two from the kiosk; log them at most every 10 s.
     POLLS = {"Diagnostics", "MissionStatus", "MappingMissionStatus", "ListJobs", "GetJob"}
@@ -537,10 +713,13 @@ def main():
     ap.add_argument("--tick", type=float, default=1.5, help="seconds per capture point")
     ap.add_argument("--autofly", action="store_true", help="start a live flight (map-flying-demo) at boot")
     ap.add_argument("--seed", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--camera", choices=CAMERA_SCENARIOS, default="verified", help="camera pre-flight scenario")
+    ap.add_argument("--camera-delay", type=float, default=1.5, help="seconds a CameraPreflight takes")
     args = ap.parse_args()
 
     data_dir = tempfile.mkdtemp(prefix="fake-soerogis-")
     backend = Backend(f"http://127.0.0.1:{args.http_port}", data_dir, args.tick)
+    backend.camera_scenario, backend.camera_delay = args.camera, args.camera_delay
     if args.seed:
         seed(backend, args.autofly)
 
