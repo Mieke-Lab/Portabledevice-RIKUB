@@ -99,9 +99,13 @@ export function useCameraCheck({ expectedShots = 0, live = null, liveAt = null }
     }
   }, [expectedShots, save]);
 
-  /** Adopt a report that arrived some other way (the push's `camera_check`). */
+  /**
+   * Adopt a report that arrived some other way (the push's `camera_check`). A `skipped` one (the
+   * operator launched with the camera preflight switched off) says nothing about the camera —
+   * adopting it would overwrite the last real check with a "no way to the camera" verdict.
+   */
   const recordReport = useCallback((report) => {
-    if (report && typeof report === "object") save({ report, checkedAt: Date.now() });
+    if (report && typeof report === "object" && !report.skipped) save({ report, checkedAt: Date.now() });
   }, [save]);
 
   /** Fire the PWM wire once — a REAL photo; the camera should beep and its live view freeze. */

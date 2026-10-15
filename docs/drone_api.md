@@ -510,12 +510,12 @@ HTTP **409**, `NOT_FOUND` as **404**, `INVALID_ARGUMENT` as **400**; the
 
 | Route | gRPC | Notes |
 |-------|------|-------|
-| `POST /api/drone/mapping-mission` | `PushCaptureMission` | Body `{capture_points, altitude?, hold_time?, session_id?}`; `400` without at least one numeric `{lat, lng}`. Timeout 70 s. |
+| `POST /api/drone/mapping-mission` | `PushCaptureMission` | Body `{capture_points, altitude?, hold_time?, session_id?, camera_preflight?}`; `400` without at least one numeric `{lat, lng}`, or when `camera_preflight` is not a real boolean. Timeout 70 s. |
 | `GET /api/drone/mapping-mission` | `MappingMissionStatus` | Live per-leg view (above). |
 | `POST /api/drone/mapping-mission/pause` | `PauseMappingMission` | Body ignored; `{}` is forwarded. |
-| `POST /api/drone/mapping-mission/resume` | `ResumeMappingMission` | Body `{session_id, altitude?, hold_time?}` (`job_id` accepted as alias). `400` when `session_id` is missing, or `altitude` / `hold_time` is not a finite number (`altitude > 0`, `hold_time >= 0`; bools rejected). Optional keys are forwarded only when present and non-null. Timeout 70 s (it uploads a plan). |
+| `POST /api/drone/mapping-mission/resume` | `ResumeMappingMission` | Body `{session_id, altitude?, hold_time?, camera_preflight?}` (`job_id` accepted as alias). `400` when `session_id` is missing, or `altitude` / `hold_time` is not a finite number (`altitude > 0`, `hold_time >= 0`; bools rejected), or `camera_preflight` is not a real boolean. Optional keys are forwarded only when present and non-null. Timeout 70 s (it uploads a plan). |
 | `POST /api/drone/mapping-mission/cancel` | `CancelMappingMission` | Body `{}` or `{session_id}`; `session_id` is forwarded only when given. |
-| `POST /api/drone/mission/execute` | `ExecuteMission` | `{mode: "mapping", job_id: session_id}` flies the leg (first or resumed). |
+| `POST /api/drone/mission/execute` | `ExecuteMission` | `{mode: "mapping", job_id: session_id, camera_preflight?}` flies the leg (first or resumed). `camera_preflight: false` skips the takeoff camera re-check; `400` when it is not a real boolean. |
 | `POST /api/drone/camera/preflight` | `CameraPreflight` | Body (all optional) `{expected_shots?, full?, heal?}`: `expected_shots` a whole number `>= 0`, `full` / `heal` real booleans (`400` otherwise — the backend would read the string `"false"` as true). `ok:false` / `wire_only:true` are **data**, not HTTP errors. Takes up to ~30 s, timeout 70 s. See [Camera pre-flight](#camera-pre-flight). |
 | `POST /api/drone/camera/trigger` | `TriggerCamera` | Body `{method?, fallback?}`; `method` is `auto` (default), `wire`, `esp_wifi`, `wifi:<iface>` or a bare adapter name (`400` for anything else, also for an unknown name from the backend). Takes a **real photo**; `409` while the vehicle is armed. Timeout 75 s. |
 | `GET /api/jobs?capture_only=true` | `ListJobs {capture_only: true}` | Plain array of session objects. `capture_only` is forwarded only when true (default request stays `{}`). |
@@ -531,6 +531,14 @@ Wi-Fi paths can *prove* a photo was taken (they check the camera's photo list); 
 evidence is the camera's own beep. `PushCaptureMission` / `ResumeMappingMission` run the same pre-flight
 themselves and return it as **`camera_check`**: a wire-only camera passes (the operator decides), no path at all
 or a camera that cannot shoot (no SD card, card full) is refused (`409`).
+
+**The operator can switch that pre-flight off.** The audit dialog of the mapping planner (the three confirmations and the
+slide) has a **Camera preflight** box, ticked by default and ticked again each time the dialog opens. Unticked, the SPA sends
+`camera_preflight: false` on `POST /mapping-mission` (or `/mapping-mission/resume`) **and** `POST /mission/execute` of that launch;
+the backend then probes nothing and refuses nothing on the camera's account (not the all-paths check, not the takeoff
+re-check), logs a warning, and answers `camera_check: {skipped: true, ok: null, warnings: [...]}` (the same keys as a real
+report; the SPA ignores it rather than showing it as a verdict). The shots themselves still fail over down the path list to the
+wire. The BFF forwards the field only when the body has it, and only as a real boolean (`400` otherwise).
 
 `POST /api/drone/camera/preflight` returns
 `{ok, mode, method, via, verified, wire_only, degraded, fallbacks[], summary, warnings[], error, paths[], camera, cached, armed, elapsed_s}`:

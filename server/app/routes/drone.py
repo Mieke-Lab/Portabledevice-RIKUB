@@ -94,18 +94,20 @@ async def push_mission(request: Request):
 
 @router.post("/mission/execute")
 async def execute_mission(request: Request):
+    """Arm -> takeoff -> AUTO (ExecuteMission). `camera_preflight` (real boolean,
+    forwarded only when given; the backend's default is true) = false skips the
+    takeoff camera re-check of a mapping flight."""
     body = await _read_json(request)
-    return await _call_grpc_in_threadpool(
-        f"{DRONE}/ExecuteMission",
-        {
-            "mode": body.get("mode"),
-            "altitude": body.get("altitude"),
-            "job_id": body.get("job_id"),
-            "session_id": body.get("session_id"),
-        },
-        30,
-        request,
-    )
+    payload: dict[str, Any] = {
+        "mode": body.get("mode"),
+        "altitude": body.get("altitude"),
+        "job_id": body.get("job_id"),
+        "session_id": body.get("session_id"),
+    }
+    camera_preflight = _optional_bool(body, "camera_preflight")
+    if camera_preflight is not None:
+        payload["camera_preflight"] = camera_preflight
+    return await _call_grpc_in_threadpool(f"{DRONE}/ExecuteMission", payload, 30, request)
 
 
 @router.post("/mapping-mission")
@@ -117,7 +119,11 @@ async def push_capture_mission(request: Request):
     and the response's `session_id` confirms it), so it is already in
     `GET /api/jobs` with `capture.state == "armed"`. Then call
     `POST /api/drone/mission/execute` with `{mode: "mapping", job_id: session_id}`
-    to fly it. See docs/mapping.md (capture block) + docs/drone_api.md."""
+    to fly it. `camera_preflight` (real boolean, forwarded only when given; the
+    backend's default is true) = false skips the camera pre-flight so the plan is
+    uploaded even when the camera is unreachable; the response's `camera_check`
+    is then `{skipped: true, ok: null, ...}`.
+    See docs/mapping.md (capture block) + docs/drone_api.md."""
     body = await _read_json(request)
     points = body.get("capture_points") or []
     valid = [
@@ -138,6 +144,7 @@ async def push_capture_mission(request: Request):
         "altitude": body.get("altitude"),
         "hold_time": body.get("hold_time"),
         "session_id": body.get("session_id"),
+        "camera_preflight": _optional_bool(body, "camera_preflight"),
     }
     payload = {key: value for key, value in payload.items() if value is not None}
     return await _call_grpc_in_threadpool(f"{DRONE}/PushCaptureMission", payload, 70, request)
@@ -221,6 +228,9 @@ async def resume_mapping_mission(request: Request):
     hold_time = _optional_number(body, "hold_time", allow_zero=True)
     if hold_time is not None:
         payload["hold_time"] = hold_time
+    camera_preflight = _optional_bool(body, "camera_preflight")
+    if camera_preflight is not None:
+        payload["camera_preflight"] = camera_preflight
     return await _call_grpc_in_threadpool(f"{DRONE}/ResumeMappingMission", payload, 70, request)
 
 

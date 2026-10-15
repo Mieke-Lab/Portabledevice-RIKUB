@@ -138,6 +138,8 @@ export async function pushMission(p) {
   );
 }
 
+// `cameraPreflight: false` (the launch dialog's "Camera preflight" box, unticked) skips the
+// backend's takeoff camera re-check of a mapping flight; omitted / null keeps its default (on).
 export async function executeMission(p = {}) {
   return jsonOrThrow(
     await fetch("/api/drone/mission/execute", {
@@ -148,6 +150,7 @@ export async function executeMission(p = {}) {
         altitude: p.altitude,
         job_id: p.jobId,
         session_id: p.jobId,
+        ...(p.cameraPreflight != null && { camera_preflight: p.cameraPreflight }),
       }),
     }),
   );
@@ -158,7 +161,9 @@ export async function executeMission(p = {}) {
 // Upload a discrete-capture-point mapping mission (PushCaptureMission): a
 // LOITER_UNLIM mission visiting each { lat, lng } station, holding for a photo.
 // Blocking upload; returns the drone status. Follow with
-// executeMission({ mode: "mapping", jobId }) to fly it.
+// executeMission({ mode: "mapping", jobId }) to fly it. `cameraPreflight: false` skips the
+// backend's camera pre-flight (the plan is accepted even if the camera is unreachable and
+// `camera_check` comes back `{ skipped: true, ok: null }`); omitted / null keeps its default (on).
 export async function pushCaptureMission(p) {
   return jsonOrThrow(
     await fetch("/api/drone/mapping-mission", {
@@ -169,6 +174,7 @@ export async function pushCaptureMission(p) {
         altitude: p.altitude,
         hold_time: p.holdTime,
         session_id: p.sessionId,
+        ...(p.cameraPreflight != null && { camera_preflight: p.cameraPreflight }),
       }),
     }),
   );
@@ -196,8 +202,9 @@ export const pauseMappingMission = () => postCommand("/api/drone/mapping-mission
 // Start the next leg of a paused / interrupted / failed session
 // (ResumeMappingMission): uploads a plan for the points not yet captured, reusing
 // the session's altitude / hold_time unless overridden. Follow with
-// executeMission({ mode: "mapping", jobId: sessionId }) to fly it.
-export async function resumeMappingMission({ sessionId, altitude, holdTime } = {}) {
+// executeMission({ mode: "mapping", jobId: sessionId }) to fly it. `cameraPreflight` as in
+// pushCaptureMission.
+export async function resumeMappingMission({ sessionId, altitude, holdTime, cameraPreflight } = {}) {
   return jsonOrThrow(
     await fetch("/api/drone/mapping-mission/resume", {
       method: "POST",
@@ -206,6 +213,7 @@ export async function resumeMappingMission({ sessionId, altitude, holdTime } = {
         session_id: sessionId,
         ...(altitude != null && { altitude }),
         ...(holdTime != null && { hold_time: holdTime }),
+        ...(cameraPreflight != null && { camera_preflight: cameraPreflight }),
       }),
     }),
   );

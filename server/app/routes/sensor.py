@@ -110,7 +110,7 @@ def _parse_packet(line: str) -> dict | None:
             "alt": _to_float(raw.get("ALT", "")),
             "sat": int(_to_float(raw.get("SAT", "")) or 0),
         }
-        gps["fix"] = bool(gps["sat"]) and (gps["lat"] or gps["lon"])
+        gps["fix"] = bool(gps["sat"]) and bool(gps["lat"] or gps["lon"])
 
     seq_match = _SEQ_RE.search(line)
     adc_match = _ADC_RE.search(line)

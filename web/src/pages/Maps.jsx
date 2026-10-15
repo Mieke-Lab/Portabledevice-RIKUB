@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import L from "leaflet";
 import * as turf from "@turf/turf";
@@ -39,6 +39,7 @@ import { createLocationMarker } from "@/components/maps/locationPopup";
 import { NdviHealthStats } from "@/components/maps/ndvi/NdviHealthStats";
 import { NdviZonesPanel } from "@/components/maps/ndvi/NdviZonesPanel";
 import { SprayTargetsPanel } from "@/components/maps/spray-targets/SprayTargetsPanel";
+import { FarmerLocationCard, sprayZoneAt } from "@/components/maps/FarmerLocationCard";
 import { ManualZoneDrawPanel } from "@/components/maps/spray-targets/ManualZoneDrawPanel";
 import { SprayingRoutePanel } from "@/components/maps/spraying-route/SprayingRoutePanel";
 import { FlightSettingsWidget } from "@/components/maps/spraying-route/FlightSettingsWidget";
@@ -97,7 +98,6 @@ export function Maps() {
   const currentMarker = useRef(null);
   const fieldLocationMarker = useRef(null);
   const userLocationMarker = useRef(null);
-  const userLocationCircle = useRef(null);
   const droneLocationMarker = useRef(null);
   const searchTimeout = useRef(null);
   const [baseLayer, setBaseLayerState] = useState("satellite");
@@ -110,6 +110,12 @@ export function Maps() {
   const [suggestions, setSuggestions] = useState([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [locating, setLocating] = useState(false);
+  // "Lokasi saya" = the soil sensor's GPS: the farmer carries it to the spray zone.
+  // The Pi has no GPS of its own, so the browser's geolocation never works here.
+  const [tracking, setTracking] = useState(false);
+  const [farmer, setFarmer] = useState(null); // {lat, lon, sat, age}
+  const [farmerError, setFarmerError] = useState("");
+  const farmerCentered = useRef(false);
   const [imageryLoading, setImageryLoading] = useState(false);
   const [imageryError, setImageryError] = useState("");
   const [ndviStats, setNdviStats] = useState(null);
@@ -1848,51 +1854,84 @@ export function Maps() {
   }
 
   function locateUser() {
-    if (!map.current || !navigator.geolocation) {
-      alert("Browser tidak mendukung geolocation.");
+    if (tracking) {
+      map.current?.flyTo([farmer.lat, farmer.lon], 18, { duration: 1 });
       return;
     }
-
+    farmerCentered.current = false;
+    setFarmer(null);
+    setFarmerError("");
     setLocating(true);
-    navigator.geolocation.getCurrentPosition(
-      (position) => {
-        const latlng = [position.coords.latitude, position.coords.longitude];
-        const accuracy = position.coords.accuracy;
-
-        if (userLocationMarker.current)
-          map.current.removeLayer(userLocationMarker.current);
-        if (userLocationCircle.current)
-          map.current.removeLayer(userLocationCircle.current);
-
-        const icon = L.divIcon({
-          className: "",
-          iconSize: [40, 40],
-          iconAnchor: [20, 20],
-          html: '<div class="relative flex h-10 w-10 items-center justify-center"><div class="absolute h-10 w-10 animate-ping rounded-full bg-[#4B7C63]/35"></div><div class="absolute h-7 w-7 rounded-full bg-[#4B7C63]/20"></div><div class="relative h-4 w-4 rounded-full border-2 border-white bg-[#4B7C63] shadow-[0_4px_14px_rgba(15,23,42,0.35)]"></div></div>',
-        });
-
-        userLocationCircle.current = L.circle(latlng, {
-          radius: accuracy,
-          color: "#4B7C63",
-          fillColor: "#4B7C63",
-          fillOpacity: 0.12,
-          opacity: 0.35,
-          weight: 1,
-        }).addTo(map.current);
-        userLocationMarker.current = L.marker(latlng, {
-          icon,
-          interactive: false,
-        }).addTo(map.current);
-        map.current.flyTo(latlng, 17, { duration: 1 });
-        setLocating(false);
-      },
-      () => {
-        setLocating(false);
-        alert("Tidak dapat menemukan lokasi. Pastikan izin lokasi aktif.");
-      },
-      { enableHighAccuracy: true },
-    );
+    setTracking(true);
   }
+
+  function stopTracking() {
+    setTracking(false);
+    setLocating(false);
+    setFarmer(null);
+    setFarmerError("");
+    if (userLocationMarker.current) map.current?.removeLayer(userLocationMarker.current);
+    userLocationMarker.current = null;
+  }
+
+  // Follow the soil sensor's GPS while tracking (every 2 s).
+  useEffect(() => {
+    if (!tracking) return undefined;
+    let alive = true;
+    let timer;
+    async function tick() {
+      try {
+        const res = await fetch("/api/sensor/latest", { cache: "no-store" });
+        const data = await res.json();
+        if (!alive) return;
+        const gps = data?.gps ?? {};
+        const lat = Number(gps.lat);
+        const lon = Number(gps.lon);
+        if (!data?.connected) {
+          setFarmerError("Sensor tanah tidak terhubung ke alat.");
+        } else if (!(gps.sat > 0) || !Number.isFinite(lat) || !Number.isFinite(lon) || (lat === 0 && lon === 0)) {
+          setFarmerError("GPS sensor tanah belum mendapat sinyal satelit. Bawa sensor ke tempat terbuka.");
+        } else {
+          setFarmerError("");
+          setFarmer({ lat, lon, sat: gps.sat, age: Number(data.age_seconds) || 0 });
+        }
+      } catch {
+        if (alive) setFarmerError("Data sensor tanah tidak terbaca dari server.");
+      } finally {
+        if (alive) {
+          setLocating(false);
+          timer = setTimeout(tick, 2000);
+        }
+      }
+    }
+    tick();
+    return () => { alive = false; clearTimeout(timer); };
+  }, [tracking]);
+
+  useEffect(() => {
+    if (!map.current || !farmer) return;
+    const latlng = [farmer.lat, farmer.lon];
+    if (!userLocationMarker.current) {
+      const icon = L.divIcon({
+        className: "",
+        iconSize: [40, 40],
+        iconAnchor: [20, 20],
+        html: '<div class="relative flex h-10 w-10 items-center justify-center"><div class="absolute h-10 w-10 animate-ping rounded-full bg-[#4B7C63]/35"></div><div class="absolute h-7 w-7 rounded-full bg-[#4B7C63]/20"></div><div class="relative h-4 w-4 rounded-full border-2 border-white bg-[#4B7C63] shadow-[0_4px_14px_rgba(15,23,42,0.35)]"></div></div>',
+      });
+      userLocationMarker.current = L.marker(latlng, { icon, interactive: false, zIndexOffset: 1100 }).addTo(map.current);
+    } else {
+      userLocationMarker.current.setLatLng(latlng);
+    }
+    if (!farmerCentered.current) {
+      farmerCentered.current = true;
+      map.current.flyTo(latlng, 18, { duration: 1 });
+    }
+  }, [farmer]);
+
+  const farmerZone = useMemo(
+    () => (farmer ? sprayZoneAt(turf, farmer, sprayTargetFeatures) : null),
+    [farmer, sprayTargetFeatures],
+  );
 
   useEffect(() => {
     const m = L.map(mapDiv.current, {
@@ -2616,8 +2655,19 @@ export function Maps() {
           />
         )}
 
+        {tracking && (
+          <FarmerLocationCard
+            farmer={farmer}
+            zone={farmerZone}
+            hasZones={sprayTargetFeatures.length > 0}
+            error={farmerError}
+            onClose={stopTracking}
+          />
+        )}
+
         <MapFloatingControls
           locating={locating}
+          locateActive={tracking}
           droneLocationAvailable={droneLocationAvailable}
           onLocate={locateUser}
           onLocateDrone={locateDrone}

@@ -19,23 +19,57 @@ const CHECKS = [
   },
 ];
 
+// What the banner says once the operator has switched the camera preflight off: nothing is
+// checked for this launch, so the last verdict (and its "the server will refuse" wording) no
+// longer describes it.
+const CAMERA_OFF_NOTICE = {
+  level: "caution",
+  title: "Camera preflight dimatikan",
+  summary: "Camera preflight dimatikan",
+  lines: [
+    "Kamera tidak diperiksa sebelum terbang, dan server tidak akan menolak misi walau kamera mati atau tidak terjangkau.",
+    "Foto yang gagal baru ketahuan setelah mendarat.",
+  ],
+};
+
 // `cameraCheck` is optional (the mapping planner passes it; the other pages don't): the
 // camera pre-flight verdict — {level, title, summary, lines, requireAck, ackLabel,
-// checking, onCheck}. It only ADDS a warning banner; when the verdict is a blind
-// wire-only camera it also adds one more required acknowledgement before the slider
-// unlocks. The three checks and the slide are unchanged.
+// checking, onCheck}. It adds a warning banner; when the verdict is a blind wire-only
+// camera it also adds one more required acknowledgement before the slider unlocks. The
+// three checks and the slide are unchanged.
+//
+// Passing it also adds the "Camera preflight" option: ticked by default, and ticked again
+// every time the dialog is reopened. Unticked, the launch skips the backend's camera
+// checks; the verdict banner and the acknowledgement then no longer apply and are replaced
+// by CAMERA_OFF_NOTICE. Execute hands the choice to `onExecute({ cameraPreflight })`; pages
+// without the option get no argument.
 export function PreFlightAuditModal({ isOpen, onClose, onExecute, cameraCheck }) {
   const [checked, setChecked] = useState({});
   const [sliderVal, setSliderVal] = useState(0);
+  const [cameraPreflight, setCameraPreflight] = useState(true);
   const isAuthorizedToSlide = useRef(false);
 
   if (!isOpen) return null;
 
-  const ackNeeded = !!cameraCheck?.requireAck;
+  const hasCameraOption = !!cameraCheck;
+  const preflightOn = !hasCameraOption || cameraPreflight;
+  const ackNeeded = preflightOn && !!cameraCheck?.requireAck;
   const allChecked = CHECKS.every((c) => checked[c.id]) && (!ackNeeded || !!checked.camera);
   const isArmed = sliderVal >= 98;
 
   const toggle = (id) => setChecked((prev) => ({ ...prev, [id]: !prev[id] }));
+
+  const toggleCameraPreflight = () => {
+    setCameraPreflight((on) => !on);
+    // The authorization was given for the launch as it was: change the launch, authorize again.
+    setSliderVal(0);
+    isAuthorizedToSlide.current = false;
+  };
+
+  const close = () => {
+    setCameraPreflight(true);
+    onClose();
+  };
 
   const handleSliderMouseDown = () => {
     if (allChecked) isAuthorizedToSlide.current = true;
@@ -63,15 +97,17 @@ export function PreFlightAuditModal({ isOpen, onClose, onExecute, cameraCheck })
 
   const handleExecute = () => {
     if (canExecute) {
+      const options = hasCameraOption ? { cameraPreflight } : undefined;
       setChecked({});
       setSliderVal(0);
-      onExecute();
+      setCameraPreflight(true);
+      onExecute(options);
     }
   };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={onClose} />
+      <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={close} />
       <div className="relative glass-panel max-h-[calc(100vh-2rem)] w-full max-w-lg overflow-y-auto rounded-2xl p-6 shadow-2xl">
         <div className="mb-4 flex items-center gap-2">
           <span className="text-xl">🛡️</span>
@@ -113,7 +149,30 @@ export function PreFlightAuditModal({ isOpen, onClose, onExecute, cameraCheck })
           ))}
         </div>
 
-        <CameraAuditBanner check={cameraCheck} />
+        {hasCameraOption && (
+          <label
+            className={`mt-3 flex cursor-pointer items-start gap-3 rounded-xl border p-3 transition ${
+              cameraPreflight ? "border-gcs-outline bg-white/20" : "border-amber-500/60 bg-amber-500/10"
+            }`}
+          >
+            <input
+              type="checkbox"
+              checked={cameraPreflight}
+              onChange={toggleCameraPreflight}
+              className="mt-0.5 h-5 w-5 shrink-0 cursor-pointer accent-gcs-primary"
+            />
+            <div>
+              <p className="text-sm font-medium text-gcs-on-surface">Camera preflight</p>
+              <p className="text-xs text-gcs-muted">
+                {cameraPreflight
+                  ? "Cek jalur kamera, kartu SD & ruang kosong sebelum terbang; misi ditolak bila kamera tak bisa memotret."
+                  : "Dimatikan — kamera tidak diperiksa dan misi tetap diunggah walau kamera tidak terjangkau."}
+              </p>
+            </div>
+          </label>
+        )}
+
+        <CameraAuditBanner check={preflightOn ? cameraCheck : CAMERA_OFF_NOTICE} />
         {ackNeeded && (
           <label
             className={`mt-3 flex cursor-pointer items-start gap-3 rounded-xl border p-3 transition ${
@@ -178,7 +237,7 @@ export function PreFlightAuditModal({ isOpen, onClose, onExecute, cameraCheck })
 
         <div className="mt-4 flex justify-end gap-3">
           <button
-            onClick={onClose}
+            onClick={close}
             className="rounded-xl border border-gcs-outline px-4 py-2 text-sm text-gcs-on-surface transition hover:bg-white/30"
           >
             Cancel

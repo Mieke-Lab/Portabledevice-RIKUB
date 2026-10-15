@@ -2,6 +2,7 @@ import { LocateFixed, Loader2, Minus, Navigation, Plus } from "lucide-react";
 
 export function MapFloatingControls({
   locating,
+  locateActive,
   droneLocationAvailable,
   onLocate,
   onLocateDrone,
@@ -41,8 +42,8 @@ export function MapFloatingControls({
         <button
           onClick={onLocate}
           disabled={locating}
-          className="grid h-12 w-12 place-items-center rounded-[16px] bg-white text-forest shadow-[0_8px_30px_rgba(0,0,0,0.12)] transition-colors hover:bg-gray-50 disabled:text-gray-400"
-          title="Lokasi saya"
+          className={`grid h-12 w-12 place-items-center rounded-[16px] shadow-[0_8px_30px_rgba(0,0,0,0.12)] transition-colors disabled:text-gray-400 ${locateActive ? "bg-forest text-white hover:bg-forest/90" : "bg-white text-forest hover:bg-gray-50"}`}
+          title="Lokasi saya (GPS sensor tanah)"
         >
           {locating ? (
             <Loader2 className="h-5 w-5 animate-spin" />

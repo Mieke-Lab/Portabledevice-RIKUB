@@ -243,6 +243,9 @@ export function MappingPlan() {
   // clobbering a later pause/cancel error, and (b) the flight UI knows the armed
   // session is waiting on a re-Execute and can offer it as one tap.
   const [launchError, setLaunchError] = useState(null);
+  // The audit modal's "Camera preflight" box as it was at the last launch / resume. The re-Execute
+  // after a failed takeoff has no modal of its own and must not quietly turn the check back on.
+  const launchCameraPreflight = useRef(true);
 
   // --- Resume mode (next leg of a half-flown session) ---
   const [resumeJob, setResumeJob] = useState(null); // the session being continued
@@ -665,9 +668,12 @@ export function MappingPlan() {
   }
 
   // --- Launch ----------------------------------------------------------------
-  async function handleLaunch() {
+  // `options` = what the audit modal hands over: { cameraPreflight } (ticked unless the operator unticked it).
+  async function handleLaunch(options) {
     if (launching) return; // one upload at a time — see the modal note below
     if (photoCount === 0) { setError("Belum ada titik foto — gambar area pemetaan dulu."); setShowAudit(false); return; }
+    const cameraPreflight = options?.cameraPreflight !== false;
+    launchCameraPreflight.current = cameraPreflight;
     setLaunching(true);
     setError(null);
     setLaunchError(null);
@@ -689,9 +695,10 @@ export function MappingPlan() {
     try {
       // PushCaptureMission creates the mapping session under this id — it is in
       // GET /api/jobs (capture.state "armed") before the aircraft even arms.
-      const pushed = await pushCaptureMission({ capturePoints: commandPoints, altitude, holdTime, sessionId: id });
+      const pushed = await pushCaptureMission({ capturePoints: commandPoints, altitude, holdTime, sessionId: id, cameraPreflight });
       // The backend ran the camera pre-flight itself before accepting the plan (a wire-only camera
       // passes — the operator decides): keep what it found, it is the freshest word on the camera.
+      // (Launched with the preflight off it sends a `skipped` placeholder, which recordReport ignores.)
       camera.recordReport(pushed?.camera_check);
     } catch (e) {
       setLockedPlan(null); // nothing exists on the backend — the plan is editable again
@@ -712,7 +719,7 @@ export function MappingPlan() {
     // the first poll replaces it with MappingMissionStatus + GetJob.
     setMission({ running: true, session_id: id, phase: "armed", captures_done: 0, total_captures: photoCount, odm_job_id: id, last_error: "" });
     try {
-      await executeMission({ mode: "mapping", altitude, jobId: id });
+      await executeMission({ mode: "mapping", altitude, jobId: id, cameraPreflight });
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Gagal memulai misi pemetaan";
       // Do NOT auto-cancel: a 504 or a dropped connection can occur after the
@@ -731,9 +738,11 @@ export function MappingPlan() {
   // Same gate (pre-flight audit) and same flight UI as a fresh launch; the only
   // difference is who owns the route: ResumeMappingMission uploads a plan for the
   // points not yet in capture.captured, so nothing is sent but the session id.
-  async function handleResume() {
+  async function handleResume(options) {
     if (launching) return; // one upload at a time — same reason as handleLaunch
     if (!resumeJob || !resumePlan) return;
+    const cameraPreflight = options?.cameraPreflight !== false; // as in handleLaunch
+    launchCameraPreflight.current = cameraPreflight;
     const id = jobIdOf(resumeJob);
     const c = captureOf(resumeJob);
     const prog = captureProgress(resumeJob);
@@ -748,11 +757,11 @@ export function MappingPlan() {
     // a drift recalibration mid-leg must not move the stations being flown.
     setLockedPlan(resumePlan);
     try {
-      const resumed = await resumeMappingMission({ sessionId: id });
+      const resumed = await resumeMappingMission({ sessionId: id, cameraPreflight });
       camera.recordReport(resumed?.camera_check);
       // Takeoff altitude is the leg's own (the session's) — the same value the
       // plan was just uploaded with.
-      await executeMission({ mode: "mapping", altitude: c?.altitude ?? altitude, jobId: id });
+      await executeMission({ mode: "mapping", altitude: c?.altitude ?? altitude, jobId: id, cameraPreflight });
       setSessionId(id);
       setConfirm(null);
       setPausing(false);
@@ -784,7 +793,10 @@ export function MappingPlan() {
     setActing(true);
     setError(null);
     try {
-      await executeMission({ mode: "mapping", altitude: captureOf(session)?.altitude ?? altitude, jobId: sessionId });
+      await executeMission({
+        mode: "mapping", altitude: captureOf(session)?.altitude ?? altitude, jobId: sessionId,
+        cameraPreflight: launchCameraPreflight.current,
+      });
       setLaunchError(null); // the poll takes it from here (armed → flying)
     } catch (e) {
       setError(`Gagal menerbangkan ulang: ${e instanceof Error ? e.message : "Gagal memulai misi pemetaan"}`);

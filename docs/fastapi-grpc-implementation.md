@@ -214,6 +214,10 @@ atau cancel). Body `resume` wajib `session_id`; `altitude`/`hold_time` opsional 
 hanya diteruskan kalau ada. Kontrak lengkap (termasuk blok `capture` di sesi) ada
 di `docs/drone_api.md` bagian "Mapping capture mission" dan `docs/mapping.md`.
 
+`mapping-mission` (push), `mapping-mission/resume` dan `mission/execute` menerima `camera_preflight` (boolean asli, opsional;
+`400` kalau bukan boolean). Diteruskan ke backend hanya kalau ada di body; `false` = lewati cek kamera pada peluncuran itu
+(kotak "Camera preflight" di dialog audit sebelum terbang; default tercentang). Tanpa field ini backend tetap memeriksa kamera.
+
 Route `camera/preflight` memeriksa semua jalur ke kamera (Wi-Fi tiap adaptor, Wi-Fi ESP32, kabel PWM, kartu SD)
 dan `camera/trigger` memotret **sungguhan** satu kali (uji kabel; ditolak 409 saat drone ARMED). Body divalidasi di
 BFF (`expected_shots` bilangan bulat >= 0, `full`/`heal`/`fallback` harus boolean asli, `method` hanya

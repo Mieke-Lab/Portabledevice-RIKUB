@@ -3,8 +3,8 @@ Description=Jaga Padi backend (FastAPI + SPA, HTTPS :8000)
 Requires=rikub-db.service
 After=rikub-db.service
 PartOf=rikub.target
-StartLimitIntervalSec=300
-StartLimitBurst=5
+# Never give up: a boot before WiFi/DB is ready must not leave the app down for hours.
+StartLimitIntervalSec=0
 
 [Service]
 Type=exec
@@ -21,7 +21,7 @@ ExecStart=/home/pi/rikub-project/server/venv/bin/uvicorn main:app \
 ExecStartPost=/home/pi/rikub-project/deploy/wait-healthy.sh 120
 TimeoutStartSec=180
 Restart=on-failure
-RestartSec=5
+RestartSec=10
 
 [Install]
 WantedBy=rikub.target

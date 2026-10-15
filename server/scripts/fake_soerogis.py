@@ -339,9 +339,19 @@ class Backend:
                 "last_preflight": self.camera_last_preflight, "last_trigger": self.camera_last_trigger,
                 "totals": dict(self.camera_totals)}
 
-    def camera_gate(self, when, expected_shots):
+    def camera_gate(self, when, expected_shots, enabled=True):
         """What PushCaptureMission / ResumeMappingMission do first: run the pre-flight, refuse when it says no
-        (a wire-only camera passes — the operator decides), and hand the report back as `camera_check`."""
+        (a wire-only camera passes — the operator decides), and hand the report back as `camera_check`.
+        `enabled=False` (the launch dialog's "Camera preflight" box, unticked → `camera_preflight: false`) checks
+        nothing, refuses nothing and returns the real backend's `skipped` placeholder."""
+        if not enabled:
+            return {"ok": None, "skipped": True, "mode": "esp" if self.camera_scenario == "esp_mode" else "wifi",
+                    "method": None, "via": None, "verified": False, "wire_only": False, "degraded": False,
+                    "summary": "camera pre-flight skipped", "fallbacks": [],
+                    "warnings": ["camera pre-flight was skipped at the operator's request; no path to the camera, "
+                                 "SD card or free space was checked"],
+                    "error": None, "paths": [], "link": None, "camera": None, "camera_via": None,
+                    "elapsed_s": 0.0, "at": time.time()}
         delay, self.camera_delay = self.camera_delay, 0.0
         try:
             report = self.CameraPreflight({"expected_shots": expected_shots})
@@ -453,7 +463,7 @@ class Backend:
         sid = p.get("session_id") or p.get("job_id") or f"map-{uuid.uuid4().hex[:8]}"
         if sid in self.sessions:
             raise RpcFail(FAILED_PRECONDITION, f"session {sid} already exists")
-        camera_check = self.camera_gate("pre-flight", len(points))
+        camera_check = self.camera_gate("pre-flight", len(points), p.get("camera_preflight") is not False)
         self.new_session(sid, capture={
             "state": "armed", "active": True, "points": points, "captured": [], "pending": [],
             "altitude": float(p.get("altitude") or 5.0), "hold_time": float(p.get("hold_time") or 0.0),
@@ -503,7 +513,7 @@ class Backend:
         remaining = [i for i in range(len(cap["points"])) if i not in cap["captured"]]
         if not remaining:
             raise RpcFail(FAILED_PRECONDITION, "nothing left to fly")
-        camera_check = self.camera_gate("pre-resume", len(remaining))
+        camera_check = self.camera_gate("pre-resume", len(remaining), p.get("camera_preflight") is not False)
         # Pending points of a failed leg are re-flown, not left as holes: they
         # stay listed ("stays here", docs/mapping.md) until the resumed leg
         # re-secures them, so the photographed tally never goes backwards.

@@ -313,6 +313,65 @@ def test_push_capture_mission_forwards_points_and_session_id(client, grpc_calls)
     assert call["timeout"] == 70
 
 
+# --- camera_preflight on the launch calls -------------------------------------
+# The launch dialog's "Camera preflight" box. Forwarded only when the SPA sends it
+# (the backend's own default is on) and only as a real boolean: the backend would
+# read the string "false" as true.
+
+PUSH_BODY = {"session_id": "map-abc123", "capture_points": [{"lat": -7.28, "lng": 112.79}]}
+LAUNCH_CALLS = [
+    ("/api/drone/mapping-mission", PUSH_BODY),
+    ("/api/drone/mapping-mission/resume", {"session_id": "map-abc123"}),
+    ("/api/drone/mission/execute", {"mode": "mapping", "job_id": "map-abc123"}),
+]
+
+
+@pytest.mark.parametrize("path,body", LAUNCH_CALLS)
+@pytest.mark.parametrize("flag", [True, False])
+def test_launch_calls_forward_camera_preflight(client, grpc_calls, path, body, flag):
+    response = client.post(path, json={**body, "camera_preflight": flag})
+
+    assert response.status_code == 200
+    assert grpc_calls["calls"][0]["payload"]["camera_preflight"] is flag
+
+
+@pytest.mark.parametrize("path,body", LAUNCH_CALLS)
+def test_launch_calls_leave_the_backend_default_when_camera_preflight_is_absent(client, grpc_calls, path, body):
+    client.post(path, json=body)
+    client.post(path, json={**body, "camera_preflight": None})
+
+    assert all("camera_preflight" not in call["payload"] for call in grpc_calls["calls"])
+    assert len(grpc_calls["calls"]) == 2
+
+
+@pytest.mark.parametrize("path,body", LAUNCH_CALLS)
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, []])
+def test_launch_calls_reject_a_non_boolean_camera_preflight(client, grpc_calls, path, body, value):
+    response = client.post(path, json={**body, "camera_preflight": value})
+
+    assert response.status_code == 400
+    assert "camera_preflight" in response.json()["detail"]
+    assert grpc_calls["calls"] == []
+
+
+def test_execute_forwards_the_flag_next_to_the_unchanged_fields(client, grpc_calls):
+    client.post(
+        "/api/drone/mission/execute",
+        json={"mode": "mapping", "altitude": 20, "job_id": "map-abc123", "session_id": "map-abc123", "camera_preflight": False},
+    )
+
+    call = grpc_calls["calls"][0]
+    assert call["method"] == f"{DRONE}/ExecuteMission"
+    assert call["payload"] == {
+        "mode": "mapping",
+        "altitude": 20,
+        "job_id": "map-abc123",
+        "session_id": "map-abc123",
+        "camera_preflight": False,
+    }
+    assert call["timeout"] == 30
+
+
 # --- CameraPreflight / TriggerCamera ------------------------------------------
 
 PREFLIGHT = {

@@ -13,7 +13,9 @@ HN=$(hostname)
 
 LAN_IPS=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)
 TS_IP=$(tailscale ip -4 2>/dev/null || true)
-ALL_IPS=$(printf '%s\n%s\n' "$LAN_IPS" "$TS_IP" | grep -v '^$' | sort -u)
+# No address yet (booting before WiFi is up): grep exits 1 on empty input, which
+# with pipefail would fail the backend start; an empty list just keeps the old cert.
+ALL_IPS=$(printf '%s\n%s\n' "$LAN_IPS" "$TS_IP" | { grep -v '^$' || true; } | sort -u)
 
 EXISTING_SAN=""
 if [ -f "$CERT" ]; then
