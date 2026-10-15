@@ -203,7 +203,7 @@ in a position-controllable mode (e.g. after `Takeoff`, which leaves it in
 ### `Diagnostics`
 
 Poll **all** drone telemetry in one call: flight-controller state plus the latest
-global position, IMU, and raw GPS messages. A consolidated alternative to one
+global position, IMU, raw GPS and compass-heading messages. A consolidated alternative to one
 endpoint per topic — intended for a frontend diagnostics panel.
 
 **Read-only.** Like `MissionStatus`, it never aborts. Each section holds the most
@@ -226,8 +226,14 @@ recent message from its topic, coerced field-for-field to JSON-native types, or
 | `global_position` | `/mavros/global_position/global` | `sensor_msgs/NavSatFix` | Fused `latitude`/`longitude` (deg), `altitude` (m), `status`, `position_covariance` (`double[9]`). |
 | `imu` | `/mavros/imu/data` | `sensor_msgs/Imu` | `orientation` (quaternion), `angular_velocity`, `linear_acceleration`, and their covariances. |
 | `gps_raw` | `/mavros/gpsstatus/gps1/raw` | `mavros_msgs/GPSRAW` | Raw receiver fix: `fix_type`, `satellites_visible`, `lat`/`lon` (degE7), `alt` (mm, MSL), `eph`/`epv`, `vel` (cm/s), `cog` (cdeg), `h_acc`/`v_acc`/`vel_acc` (mm), `hdg_acc` (degE5), `yaw` (cdeg). |
+| `compass` | `/mavros/global_position/compass_hdg` | `std_msgs/Float64` | The aircraft's own heading: `heading_deg` (0 = North, 90 = East, clockwise — the way the nose points) and `age_s` (how old the sample is on the backend; no absolute timestamp is sent, the GCS and the aircraft PC do not share a clock). Published at the position rate, so unlike `imu` and `gps_raw` — which need their own MAVLink streams and are silent on some FCU setups — it is there whenever `global_position` is. `null` until the first sample, or when the FCU has no heading. |
 | `flow` | ESP serial | — | Flow-meter telemetry: fleet-wide `flow_rate_lpm`/`total_liters` plus a per-sensor `sensors[]` breakdown. `null` until the ESP link has a reading. |
 | `spray` | — | — | Compact live spraying state (see [Spraying](#spraying-pipeline)): `running`, `phase`, `in_zone`, `zone_id`, `speed_mps`, per-pump `right`/`left` (`target_lpm`, `measured_lpm`, `pwm`/`on`, `liters`), `last_seq`. |
+
+> **Heading for a map marker.** Use, in this order, the first one that is present: `gps_raw.yaw` (cdeg, ignore `0` and
+> `65535`), `imu.orientation` (ENU quaternion → yaw; bearing = 90° − yaw), `compass.heading_deg` (ignore it when `age_s` is
+> more than a few seconds), then `gps_raw.cog`. Only `compass` is present on every FCU configuration; the GCS Pi's
+> `headingDeg()` (`web/src/lib/gcs/diagnostics.js`) implements exactly this.
 
 > **`available: false` vs a `null` section.** `available: false` means the
 > controller is down (no ROS/FCU link) and **all** sections are `null`. When
@@ -267,6 +273,7 @@ A representative populated response (covariances abbreviated):
     "alt_ellipsoid": 12000, "h_acc": 500, "v_acc": 800, "vel_acc": 200,
     "hdg_acc": 10000, "yaw": 9000, "dgps_numch": 0, "dgps_age": 0
   },
+  "compass": { "heading_deg": 105.82, "age_s": 0.31 },
   "flow": {
     "connected": true, "flow_rate_lpm": 2.3, "total_liters": 5.5,
     "raw_hz": 146.0, "total_pulses": 24090, "pulses_per_liter": 4380.0, "updated_at": 1789456.1,

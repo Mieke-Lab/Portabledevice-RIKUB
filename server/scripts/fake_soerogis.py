@@ -27,7 +27,8 @@ error — so the planner's "Cek Kamera" can be exercised in every state. Pick on
 
 Flags: --port 50052 · --http-port 8765 · --tick 1.5 (seconds per photo) ·
        --autofly (start a live flight at boot) · --no-seed (empty registry) ·
-       --camera verified (camera scenario) · --camera-delay 1.5 (seconds a pre-flight takes).
+       --camera verified (camera scenario) · --camera-delay 1.5 (seconds a pre-flight takes) ·
+       --bare-fcu (Diagnostics like the real FCU: imu/gps_raw null, heading only in `compass`).
 """
 import argparse
 import json
@@ -109,6 +110,10 @@ class Backend:
         self.last_leg = None  # what MappingMissionStatus keeps reporting once a leg settled
         self.drone = {"armed": False, "mode": "GUIDED", "lat": HOME[0], "lng": HOME[1], "alt": 0.0,
                       "heading": 90.0, "job_id": "idle", "mission_running": False, "last_command": "", "last_error": ""}
+        # The FCU we fly streams neither ATTITUDE nor GPS_RAW_INT, so the real Diagnostics has `imu: null` and
+        # `gps_raw: null` and the only heading is `compass` — `--bare-fcu` reproduces that (the markers used to
+        # face north on exactly that payload).
+        self.bare_fcu = False
         self.camera_scenario, self.camera_delay = "verified", 1.5
         self.camera_last_preflight, self.camera_last_trigger = None, None
         self.camera_totals = {"wifi": 0, "esp_wifi": 0, "wire": 0, "esp": 0, "skipped": 0}
@@ -279,11 +284,14 @@ class Backend:
                 "state": {"connected": True, "armed": d["armed"], "guided": True, "manual_input": False,
                           "mode": d["mode"], "system_status": 4},
                 "global_position": {"latitude": d["lat"], "longitude": d["lng"], "altitude": 12.0 + d["alt"]},
-                "imu": {"orientation": {"x": 0.0, "y": 0.0, "z": math.sin(yaw / 2), "w": math.cos(yaw / 2)}},
-                "gps_raw": {"fix_type": 3, "satellites_visible": 14, "lat": int(d["lat"] * 1e7),
-                            "lon": int(d["lng"] * 1e7), "alt": int((12.0 + d["alt"]) * 1000), "eph": 80, "epv": 120,
-                            "vel": 350 if d["mission_running"] else 0, "cog": int(d["heading"] * 100),
-                            "yaw": int(d["heading"] * 100) or 36000},
+                "imu": None if self.bare_fcu else
+                {"orientation": {"x": 0.0, "y": 0.0, "z": math.sin(yaw / 2), "w": math.cos(yaw / 2)}},
+                "gps_raw": None if self.bare_fcu else
+                {"fix_type": 3, "satellites_visible": 14, "lat": int(d["lat"] * 1e7),
+                 "lon": int(d["lng"] * 1e7), "alt": int((12.0 + d["alt"]) * 1000), "eph": 80, "epv": 120,
+                 "vel": 350 if d["mission_running"] else 0, "cog": int(d["heading"] * 100),
+                 "yaw": int(d["heading"] * 100) or 36000},
+                "compass": {"heading_deg": round(d["heading"] % 360, 2), "age_s": 0.2},
                 "flow": None, "spray": None, "camera": self.camera_diagnostics()}
 
     # ---- camera (docs/drone_api.md → Camera interface) ---------------------------------
@@ -725,11 +733,14 @@ def main():
     ap.add_argument("--seed", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--camera", choices=CAMERA_SCENARIOS, default="verified", help="camera pre-flight scenario")
     ap.add_argument("--camera-delay", type=float, default=1.5, help="seconds a CameraPreflight takes")
+    ap.add_argument("--bare-fcu", action="store_true",
+                    help="Diagnostics like the real FCU: imu and gps_raw null, only the compass heading")
     args = ap.parse_args()
 
     data_dir = tempfile.mkdtemp(prefix="fake-soerogis-")
     backend = Backend(f"http://127.0.0.1:{args.http_port}", data_dir, args.tick)
     backend.camera_scenario, backend.camera_delay = args.camera, args.camera_delay
+    backend.bare_fcu = args.bare_fcu
     if args.seed:
         seed(backend, args.autofly)
 

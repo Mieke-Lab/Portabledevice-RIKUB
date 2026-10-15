@@ -1,5 +1,5 @@
 import { Activity, Ban, Camera, Droplets, FolderOpen, Gauge, Loader2, Navigation2, Radar, Satellite } from "lucide-react";
-import { gpsFixLabel } from "@/lib/gcs/diagnostics";
+import { gpsFixLabel, headingDeg } from "@/lib/gcs/diagnostics";
 import { captureProgress, missionPhaseLabel } from "@/lib/gcs/mapping-capture";
 import { PUMP_DRUGS, legendItems, chamberDisplayLabel } from "@/lib/gcs/spray-overlay";
 
@@ -215,12 +215,7 @@ export function MonitoringPanel({
     : Number.isFinite(gps?.vel)
       ? gps.vel / 100
       : NaN;
-  const heading =
-    gps?.yaw != null && Number.isFinite(gps.yaw) && gps.yaw !== 0 && gps.yaw !== 65535
-      ? (gps.yaw / 100) % 360
-      : gps?.cog != null && Number.isFinite(gps.cog) && gps.cog >= 0 && gps.cog < 36000
-        ? (gps.cog / 100) % 360
-        : NaN;
+  const heading = headingDeg(diagnostics) ?? NaN;
 
   const connText = online ? (stale ? "Telemetri usang" : "Drone terhubung") : "Drone offline";
   const connDot = online ? (stale ? "bg-amber-300" : "bg-emerald-300") : "bg-slate-400";

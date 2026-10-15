@@ -33,7 +33,7 @@ import {
   CAMERA_PRESETS, DEFAULT_CAMERA, cameraById, surveySpacing, planSurvey,
 } from "@/lib/gcs/survey-grid";
 import {
-  useDroneOffset, hasOffset, applyOffsetToCoords, correctGeoWaypointsForCommand,
+  useDroneOffset, hasOffset, applyOffsetToCoords, applyOffsetToHeading, correctGeoWaypointsForCommand,
 } from "@/lib/gcs/drone-offset";
 
 const NOMINAL_SPEED_MPS = 5; // display-only estimate for flight-time (WPNAV cruise)
@@ -184,7 +184,7 @@ export function MappingPlan() {
   const displayDrone = applyOffsetToCoords(drone, offset); // {lat, lng} drift-corrected
   const displayLat = displayDrone?.lat ?? null;
   const displayLng = displayDrone?.lng ?? null;
-  const displayHeading = headingDeg(diag);
+  const displayHeading = applyOffsetToHeading(headingDeg(diag), offset); // like Maps / Monitoring / Flight plan
   // FCU armed flag straight from Diagnostics. A resume is only sane with the
   // aircraft down and disarmed; after an `interrupted` leg the backend no longer
   // knows, so this live bit is the only thing standing between the operator and

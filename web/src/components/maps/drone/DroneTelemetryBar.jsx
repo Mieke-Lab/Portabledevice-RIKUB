@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { ChevronLeft, ChevronRight } from "lucide-react";
-import { gpsFixLabel, isStale, useDiagnostics } from "@/lib/gcs/diagnostics";
+import { gpsFixLabel, headingDeg, isStale, useDiagnostics } from "@/lib/gcs/diagnostics";
 import { useDroneSettings } from "@/lib/gcs/drone-settings";
 
 function TelemetrySection({ title, rows }) {
@@ -51,12 +51,8 @@ export function DroneTelemetryBar({ collapsed, onToggle }) {
   const stale = !error && isStale(updatedAt, Math.max(10_000, pollIntervalMs * 3))
   const offline = !!error || !data || !data.available
 
-  const heading =
-    gps?.yaw != null && Number.isFinite(gps.yaw) && gps.yaw !== 0 && gps.yaw !== 65535
-      ? `${((gps.yaw / 100) % 360).toFixed(0)}°`
-      : gps?.cog != null && Number.isFinite(gps.cog) && gps.cog >= 0 && gps.cog < 36000
-        ? `${((gps.cog / 100) % 360).toFixed(0)}°`
-        : "—"
+  const headingValue = headingDeg(data)
+  const heading = headingValue != null ? `${headingValue.toFixed(0)}°` : "—"
 
   const sections = [
     {
@@ -78,7 +74,7 @@ export function DroneTelemetryBar({ collapsed, onToggle }) {
         ["Lat", gps?.lat != null ? (gps.lat / 1e7).toFixed(6) : "—"],
         ["Lon", gps?.lon != null ? (gps.lon / 1e7).toFixed(6) : "—"],
         ["Speed", gps?.vel != null ? `${(gps.vel / 100).toFixed(1)} m/s` : "—"],
-        ["Course", heading],
+        ["Heading", heading],
         ["EPH", gps?.eph ?? "—"],
         ["EPV", gps?.epv ?? "—"],
         ["Alt MSL", gps?.alt != null ? `${(gps.alt / 1000).toFixed(1)} m` : "—"],

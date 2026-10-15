@@ -106,6 +106,17 @@ function quaternionYawDeg(q) {
   return ((yaw * 180) / Math.PI + 360) % 360;
 }
 
+// A compass sample older than this is not the nose direction any more (FCU link stuck, backend replaying its last
+// value): fall through to the other sources, or to "unknown".
+const COMPASS_MAX_AGE_S = 5;
+
+/**
+ * Compass bearing the drone's nose points to (0 = N, 90 = E, clockwise), or null when nothing says.
+ * First source present wins: GPS-derived yaw, the IMU quaternion, the backend's `compass` (the FCU's own heading,
+ * MAVROS compass_hdg), then course over ground. gps_raw and imu need their own MAVLink streams and are null on the
+ * FCU we fly (so every map marker sat at its rest pose, facing north); `compass` rides on the position stream and
+ * is there whenever the marker is.
+ */
 export function headingDeg(data) {
   if (!data) return null;
   const gps = data.gps_raw;
@@ -115,6 +126,10 @@ export function headingDeg(data) {
   }
   if (data.imu?.orientation) {
     return (90 - quaternionYawDeg(data.imu.orientation) + 360) % 360;
+  }
+  const compass = data.compass?.heading_deg;
+  if (Number.isFinite(compass) && compass >= 0 && compass <= 360 && !(data.compass.age_s > COMPASS_MAX_AGE_S)) {
+    return compass % 360;
   }
   const cog = gps?.cog;
   if (cog != null && Number.isFinite(cog) && cog >= 0 && cog < 36000) {
