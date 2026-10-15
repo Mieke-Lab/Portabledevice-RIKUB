@@ -199,6 +199,54 @@ export function liveAsReport(live) {
   };
 }
 
+/**
+ * `Diagnostics.camera` at a glance, for the Monitoring panel while a mapping survey flies: the way the next photo takes,
+ * whether it will be confirmed and every path's state. Only what the backend's own path monitor knows right now — no SD
+ * card (that needs a pre-flight) and no photo counts (the mapping status has those, per mission; `totals` here run for the
+ * life of the backend). Null until a camera section exists.
+ *
+ * Returns `{tone: ok|warn|bad|muted, headline, detail, method, verified, paths[]}`; each path is
+ * `{name, label, state, stateLabel, tone, role: next|backup|null, latencyMs}`.
+ */
+export function liveCameraSummary(live) {
+  if (!live || typeof live !== "object") return null;
+  if (live.mode === "esp") {
+    return { tone: "warn", headline: "Kabel PWM (mode lama)", detail: "Foto tidak terverifikasi — hanya pulsa ke kamera.", method: "esp", verified: false, paths: [] };
+  }
+  const method = live.method || null;
+  const raw = Array.isArray(live.paths) ? live.paths : [];
+  const paths = orderPaths(raw, method).map((path) => {
+    const meta = pathStateMeta(path.state);
+    return {
+      name: path.name,
+      label: pathLabel(path),
+      state: path.state,
+      stateLabel: meta.label,
+      tone: meta.tone,
+      role: pathRole(path, method),
+      latencyMs: Number.isFinite(path.latency_ms) ? path.latency_ms : null,
+    };
+  });
+  const base = { method, paths };
+  if (!method) {
+    if (raw.length === 0 || raw.every((path) => !path.state || path.state === "unknown")) {
+      return { ...base, tone: "muted", headline: "Belum dipantau", detail: "Pemantau jalur kamera belum selesai memeriksa.", verified: false };
+    }
+    return { ...base, tone: "bad", headline: "Kamera tidak terjangkau", detail: "Semua jalur mati — foto tidak bisa dipicu.", verified: false };
+  }
+  if (method === "wire") {
+    return { ...base, tone: "warn", headline: methodLabel(method), detail: "Foto tidak terverifikasi — hanya kabel yang menjangkau kamera.", verified: false };
+  }
+  const problems = problemPaths(raw).length;
+  return {
+    ...base,
+    tone: problems ? "warn" : "ok",
+    headline: methodLabel(method),
+    detail: problems ? `Foto terverifikasi · ${problems} jalur bermasalah` : "Foto terverifikasi",
+    verified: true,
+  };
+}
+
 /** How bad the way to the camera is: 0 a Wi-Fi path (or the legacy interface), 1 only the wire, 2 nothing. */
 function pathRank(report) {
   if (report.mode === "esp") return 0;

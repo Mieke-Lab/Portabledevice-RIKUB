@@ -602,12 +602,15 @@ to lay down and drives the two pumps to match — closing the loop on the flowme
 
 | Pump | FC output | Actuation | Controller | Flowmeter |
 |------|-----------|-----------|------------|-----------|
-| **right** | servo channel 9 | `MAV_CMD_DO_SET_SERVO` (PWM speed) | PID → PWM | `FLOW 2` (D4) |
-| **left** | servo 10 (PWM broken) | `MAV_CMD_DO_SET_RELAY` (on/off) | hysteresis (bang-bang) | `FLOW 1` (D32) |
+| **right** | servo channel 9 (`SPRAY_RIGHT_SERVO_CHANNEL`) | `MAV_CMD_DO_SET_SERVO` (PWM speed) | PID → PWM | `FLOW 2` (D4) |
+| **left** | servo channel 10 (`SPRAY_LEFT_SERVO_CHANNEL`) | `MAV_CMD_DO_SET_SERVO` (PWM speed) | PID → PWM | `FLOW 1` (D32) |
 
-The left pump is temporarily on/off via relay **instance 10** (`SPRAY_LEFT_RELAY_INDEX`)
-while its PWM output is broken; its controller has the same interface as the right
-pump, so it upgrades to PID→PWM by flipping one config value once the servo is fixed.
+Both pumps are Hobbywing-ESC pumps with real PWM speed control, each with its own PID
+on its own flowmeter (and its own gains and PWM range, see `SetSprayConfig`). Until
+2026-10-16 the left pump was an on/off relay pump (`MAV_CMD_DO_SET_RELAY`, hysteresis,
+`left.on`); that path is gone. The FC clamps every command to the output's
+`SERVOn_MIN`/`SERVOn_MAX` (1050/1950 on the bench FC), so a commanded `pwm_min`
+of 1000 µs reaches the ESC as 1050.
 
 **Dose model.** For each liquid, per tick:
 
@@ -722,8 +725,8 @@ overlay. **Read-only**, never aborts.
 | `speed_mps` | float | Ground speed used for the dose. |
 | `right.target_lpm` / `left.target_lpm` | float | Commanded flow setpoint (L/min); `0` when not spraying. |
 | `right.measured_lpm` / `left.measured_lpm` | float | Flowmeter reading (L/min). |
-| `right.pwm` | int | Right-pump servo PWM (µs); `pwm_min` = off. |
-| `left.on` | bool | Left-pump relay state. |
+| `right.pwm` / `left.pwm` | int | Servo PWM (µs) commanded to that pump; that pump's `pwm_min` = off. |
+| `right.on` / `left.on` | bool | The pump is commanded above its off PWM (`pwm > pwm_min`). Derived from `pwm`; kept for clients that used `left.on` while the left pump was a relay. |
 | `right.liters` / `left.liters` | float | Cumulative litres per pump (`current` only). |
 
 Draw each `sample` as a swath-wide segment along `(lat,lng)`, coloured by
@@ -731,19 +734,22 @@ Draw each `sample` as a swath-wide segment along `(lat,lng)`, coloured by
 
 ### `SetSprayConfig`
 
-Runtime tuning without a redeploy — for manually tuning each pump's PID/thresholds
-in the field. All fields optional; returns the full current config.
+Runtime tuning without a redeploy — for manually tuning each pump's PID and PWM range
+in the field. All fields optional; returns the full current config (which also lists
+`right_servo_channel`, `left_servo_channel` and the flowmeter ids). The old
+`left_on_threshold_lpm`/`left_off_threshold_lpm` relay keys are ignored.
 
 | Field | Applies to |
 |-------|-----------|
 | `right_kp`, `right_ki`, `right_kd` | right-pump PID gains |
-| `pwm_min`, `pwm_max` | right-pump PWM range |
-| `left_on_threshold_lpm`, `left_off_threshold_lpm` | left-pump relay hysteresis (L/min) |
+| `left_kp`, `left_ki`, `left_kd` | left-pump PID gains |
+| `right_pwm_min`, `right_pwm_max`, `left_pwm_min`, `left_pwm_max` | per-pump PWM range (µs) |
+| `pwm_min`, `pwm_max` | shorthand: set BOTH pumps' PWM range (a per-pump key in the same request wins). They used to mean the right pump only; the response still echoes the right pump's values under these names |
 | `swath_width_m`, `min_speed_mps` | dose model |
 | `rate_right_lpha`, `rate_left_lpha` | default rates for future missions (an armed mission keeps its zone rates) |
 
 ```json
-{ "right_kp": 0.2, "right_ki": 0.35, "left_on_threshold_lpm": 0.05 }
+{ "right_kp": 0.2, "right_ki": 0.35, "left_kp": 0.2, "left_pwm_min": 1050 }
 ```
 
 ### `CancelSprayMission`

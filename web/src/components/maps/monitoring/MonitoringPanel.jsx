@@ -1,6 +1,8 @@
 import { Activity, Ban, Camera, Droplets, FolderOpen, Gauge, Loader2, Navigation2, Radar, Satellite } from "lucide-react";
+import { liveCameraSummary } from "@/lib/gcs/camera-check";
 import { gpsFixLabel, headingDeg } from "@/lib/gcs/diagnostics";
 import { captureProgress, missionPhaseLabel } from "@/lib/gcs/mapping-capture";
+import { doseRangeLabel, plannedDose, zoneDose } from "@/lib/gcs/spray-dose";
 import { PUMP_DRUGS, legendItems, chamberDisplayLabel } from "@/lib/gcs/spray-overlay";
 
 // Phase → badge appearance. Mirrors the spray lifecycle in docs/drone_api.md.
@@ -45,14 +47,27 @@ function StatTile({ label, value, unit, Icon }) {
   );
 }
 
-function PumpCard({ drug, accent, pump }) {
+function PumpFigure({ label, value, unit }) {
+  return (
+    <div>
+      <div className="text-[7px] font-bold uppercase tracking-[0.08em] text-slate-400">{label}</div>
+      <div className="text-[11px] font-black tabular-nums text-white">{value}</div>
+      <div className="text-[7px] font-semibold text-slate-500">{unit}</div>
+    </div>
+  );
+}
+
+// `dose` is the L/ha the plan sets for this chamber in the zone the aircraft is in right now (null outside any zone);
+// `plan` is the plan's dose for the chamber over all its zones (spray-dose.js), null when the status has no zones.
+function PumpCard({ drug, accent, pump, dose, plan }) {
   const target = Number.isFinite(pump?.target_lpm) ? pump.target_lpm : 0;
   const measured = Number.isFinite(pump?.measured_lpm) ? pump.measured_lpm : 0;
   const liters = Number.isFinite(pump?.liters) ? pump.liters : 0;
   const on = measured > 0.01 || target > 0.001 || pump?.on === true;
   const fill = target > 0 ? Math.min(1, measured / target) : on ? 1 : 0;
+  const unused = plan != null && plan.zones === 0 && !on;
   return (
-    <div className="rounded-xl border border-white/10 bg-white/5 p-2">
+    <div className={`rounded-xl border border-white/10 bg-white/5 p-2 ${unused ? "opacity-60" : ""}`}>
       <div className="flex items-center justify-between">
         <span className="flex items-center gap-1.5 text-[9px] font-black uppercase tracking-[0.1em] text-slate-200">
           <span className="h-2 w-2 rounded-full" style={{ background: accent }} />
@@ -65,20 +80,19 @@ function PumpCard({ drug, accent, pump }) {
       <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-white/10">
         <div className="h-full rounded-full transition-[width]" style={{ width: `${Math.round(fill * 100)}%`, background: accent }} />
       </div>
-      <div className="mt-1.5 grid grid-cols-3 gap-1 text-center">
-        <div>
-          <div className="text-[7px] font-bold uppercase tracking-[0.08em] text-slate-400">Target</div>
-          <div className="text-[11px] font-black tabular-nums text-white">{num(target, 2)}</div>
-        </div>
-        <div>
-          <div className="text-[7px] font-bold uppercase tracking-[0.08em] text-slate-400">Ukur</div>
-          <div className="text-[11px] font-black tabular-nums text-white">{num(measured, 2)}</div>
-        </div>
-        <div>
-          <div className="text-[7px] font-bold uppercase tracking-[0.08em] text-slate-400">Liter</div>
-          <div className="text-[11px] font-black tabular-nums text-white">{num(liters, 1)}</div>
-        </div>
+      <div className="mt-1.5 grid grid-cols-4 gap-1 text-center">
+        <PumpFigure label="Dosis" value={dose == null ? "—" : num(dose, 0)} unit="L/ha" />
+        <PumpFigure label="Target" value={num(target, 2)} unit="L/mnt" />
+        <PumpFigure label="Ukur" value={num(measured, 2)} unit="L/mnt" />
+        <PumpFigure label="Liter" value={num(liters, 1)} unit="L" />
       </div>
+      {plan && (
+        <div className="mt-1.5 border-t border-white/10 pt-1 text-[9px] font-semibold text-slate-400">
+          {plan.zones > 0
+            ? `Rencana ${doseRangeLabel(plan)} L/ha · ${plan.zones} zona${plan.liters > 0 ? ` · ≈ ${num(plan.liters, plan.liters < 10 ? 2 : 1)} L` : ""}`
+            : "Tidak dipakai di misi ini"}
+        </div>
+      )}
     </div>
   );
 }
@@ -145,6 +159,53 @@ function MappingCard({ status, job }) {
   );
 }
 
+const TONE_TEXT = { ok: "text-emerald-300", warn: "text-amber-300", bad: "text-rose-300", muted: "text-slate-400" };
+const TONE_DOT = { ok: "bg-emerald-300", warn: "bg-amber-300", bad: "bg-rose-400", muted: "bg-slate-500" };
+
+// The way to the camera right now (Diagnostics.camera, kept fresh by the backend's own path monitor): which path the
+// next photo takes, whether it will be confirmed, and every path's state. Photo counts live in MappingCard.
+function CameraCard({ camera }) {
+  const summary = liveCameraSummary(camera);
+  if (!summary) {
+    return (
+      <div className="rounded-xl border border-white/10 bg-white/5 p-2.5 text-[10px] font-semibold text-slate-400">
+        Status kamera belum dilaporkan drone.
+      </div>
+    );
+  }
+  return (
+    <div className="rounded-xl border border-white/10 bg-white/5 p-2.5">
+      <div className="flex items-baseline justify-between gap-2">
+        <span className="text-[8px] font-bold uppercase tracking-[0.12em] text-slate-400">Kamera</span>
+        <span className={`flex min-w-0 items-center gap-1.5 text-[10px] font-black uppercase tracking-[0.06em] ${TONE_TEXT[summary.tone]}`}>
+          <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${TONE_DOT[summary.tone]}`} />
+          <span className="truncate">{summary.headline}</span>
+        </span>
+      </div>
+      <div className={`mt-1 text-[10px] font-semibold ${TONE_TEXT[summary.tone]}`}>{summary.detail}</div>
+      {summary.paths.length > 0 && (
+        <div className="mt-1.5 space-y-0.5">
+          {summary.paths.map((path) => (
+            <div key={path.name} className="flex items-center justify-between gap-2 text-[9px]">
+              <span className="flex min-w-0 items-center gap-1.5 text-slate-300">
+                <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${TONE_DOT[path.tone]}`} />
+                <span className="truncate font-semibold">{path.label}</span>
+                {path.role === "next" && (
+                  <span className="shrink-0 rounded bg-white/10 px-1 text-[7px] font-black uppercase tracking-[0.08em] text-white">dipakai</span>
+                )}
+              </span>
+              <span className={`shrink-0 font-semibold tabular-nums ${TONE_TEXT[path.tone]}`}>
+                {path.stateLabel}
+                {path.latencyMs != null ? ` · ${path.latencyMs} ms` : ""}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Legend({ chambers, chamberProducts }) {
   const rows = legendItems(chambers, chamberProducts);
   return (
@@ -199,11 +260,19 @@ export function MonitoringPanel({
   const current = spray?.current ?? null;
   const totals = spray?.totals ?? null;
 
+  // What the panel shows follows the mission in front of the operator: a mapping survey (photos, camera), a spray mission
+  // (pumps, dose, sprayed area) and, for a drone with no mission, only the basic flight stats. A spray plan that is loaded
+  // but not launched still counts as idle: the status stays "idle" until the mission is pushed and executed, and keeps
+  // "complete"/"failed" afterwards so the finished mission can be looked at.
+  const sprayLive = spray?.running === true || (spray?.phase != null && spray.phase !== "idle");
   const isMapping = mode === "mapping";
+  const isSpray = !isMapping && mode === "spray" && sprayLive;
   const phaseKey = spray?.phase ?? "idle";
-  const phase = isMapping ? mappingPhaseMeta(mapping?.status?.phase) : PHASE_META[phaseKey] ?? PHASE_META.idle;
-  const running = !isMapping && spray?.running === true;
-  const missionLabel = isMapping ? "Misi Pemetaan" : mode === "spray" ? "Misi Semprot" : "Status Misi";
+  const phase = isMapping ? mappingPhaseMeta(mapping?.status?.phase) : isSpray ? PHASE_META[phaseKey] ?? PHASE_META.idle : PHASE_META.idle;
+  const running = isSpray && spray?.running === true;
+  const missionLabel = isMapping ? "Misi Pemetaan" : isSpray ? "Misi Semprot" : "Status Misi";
+  const zones = Array.isArray(spray?.zones) ? spray.zones : null;
+  const zoneNow = current?.in_zone ? current.zone_id : null;
 
   const altitude = Number.isFinite(global?.altitude)
     ? global.altitude
@@ -259,13 +328,10 @@ export function MonitoringPanel({
           <StatTile label="Alt" value={num(altitude, 1)} unit="m" />
           <StatTile label="Laju" value={num(speed, 1)} unit="m/s" Icon={Gauge} />
         </div>
-        <div className="grid grid-cols-2 gap-1.5">
+        <div className={`grid gap-1.5 ${isMapping || isSpray ? "grid-cols-2" : "grid-cols-3"}`}>
           <StatTile label="Arah" value={Number.isFinite(heading) ? Math.round(heading) : "—"} unit="°" Icon={Navigation2} />
-          {isMapping ? (
-            <StatTile label="Leg" value={mapping?.status?.leg ?? mapping?.job?.capture?.leg ?? "—"} />
-          ) : (
-            <StatTile label="Zona" value={current?.in_zone ? current.zone_id || "—" : "Luar"} />
-          )}
+          {isMapping && <StatTile label="Leg" value={mapping?.status?.leg ?? mapping?.job?.capture?.leg ?? "—"} />}
+          {isSpray && <StatTile label="Zona" value={current?.in_zone ? current.zone_id || "—" : "Luar"} />}
         </div>
 
         {isMapping ? (
@@ -274,15 +340,28 @@ export function MonitoringPanel({
               <Camera className="h-3 w-3" /> Pemotretan
             </div>
             <MappingCard status={mapping?.status} job={mapping?.job} />
+            <CameraCard camera={diagnostics?.camera} />
           </>
-        ) : (
+        ) : isSpray ? (
           <>
             {/* Pumps */}
             <div className="flex items-center gap-1.5 pt-0.5 text-[9px] font-bold uppercase tracking-[0.12em] text-emerald-300">
               <Droplets className="h-3 w-3" /> Pompa Semprot
             </div>
-            <PumpCard drug={chamberDisplayLabel(PUMP_DRUGS.right.key, chamberProducts)} accent={PUMP_DRUGS.right.ramp[2]} pump={current?.right} />
-            <PumpCard drug={chamberDisplayLabel(PUMP_DRUGS.left.key, chamberProducts)} accent={PUMP_DRUGS.left.ramp[2]} pump={current?.left} />
+            <PumpCard
+              drug={chamberDisplayLabel(PUMP_DRUGS.right.key, chamberProducts)}
+              accent={PUMP_DRUGS.right.ramp[2]}
+              pump={current?.right}
+              dose={zoneDose(zones, zoneNow, "right")}
+              plan={plannedDose(zones, "right")}
+            />
+            <PumpCard
+              drug={chamberDisplayLabel(PUMP_DRUGS.left.key, chamberProducts)}
+              accent={PUMP_DRUGS.left.ramp[2]}
+              pump={current?.left}
+              dose={zoneDose(zones, zoneNow, "left")}
+              plan={plannedDose(zones, "left")}
+            />
 
             {totals && (
               <div className="grid grid-cols-2 gap-1.5">
@@ -293,6 +372,10 @@ export function MonitoringPanel({
 
             <Legend chambers={chambers} chamberProducts={chamberProducts} />
           </>
+        ) : (
+          <div className="rounded-xl border border-dashed border-white/10 px-2.5 py-3 text-center text-[10px] font-semibold leading-snug text-slate-400">
+            Tidak ada misi berjalan. Pompa, dosis, dan status kamera tampil begitu misi semprot atau pemetaan dimulai.
+          </div>
         )}
       </div>
 
