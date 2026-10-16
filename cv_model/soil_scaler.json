@@ -1,0 +1,13 @@
+{
+  "feats": ["Temp", "Moisture", "Conductivity", "pH", "N", "P", "K", "Fertility"],
+  "lo": [22.31999969482422, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0],
+  "rr2": [12.65999984741211, 100.0, 1350.6099853515625, 4.5, 66.69999694824219, 93.08999633789062, 213.63999938964844, 699.0],
+  "note": "min-max scaling: Sn=(soil-lo)/rr2, fit on train split. Model input is 8-d in 'feats' order.",
+  "fertility_impute": {
+    "sensed_order": ["Temp", "Moisture", "Conductivity", "pH", "N", "P", "K"],
+    "intercept": -6.95705,
+    "coef": [0.13758, 0.14564, 0.13005, 1.69438, 2.69183, 1.7879, 0.75431],
+    "r2": 0.8427,
+    "note": "deployment probe senses 7 channels; the 8th feature (Fertility) is imputed as intercept + coef.dot(sensed 7). Validated harmless: max P_final change <1e-3, 0 decision flips on held-out."
+  }
+}

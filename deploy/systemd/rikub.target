@@ -1,0 +1,10 @@
+# Jaga Padi: groups every service the app needs so they come up once at boot
+# (via the user manager + linger) instead of all at once when the icon is tapped.
+# Start order and pacing live in the individual units:
+#   rikub-db  ->  rikub-backend  ->  rikub-cv   (each waits for the previous to be READY)
+[Unit]
+Description=Jaga Padi services (DB, backend, CV)
+Wants=rikub-db.service rikub-backend.service rikub-cv.service rikub-cert-watch.timer
+
+[Install]
+WantedBy=default.target

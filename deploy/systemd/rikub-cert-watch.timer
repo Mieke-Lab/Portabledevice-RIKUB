@@ -1,0 +1,12 @@
+[Unit]
+Description=Jaga Padi: periodic HTTPS cert check
+PartOf=rikub.target
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+# Coalesce with other timers so the CPU wakes less often.
+AccuracySec=1min
+
+[Install]
+WantedBy=rikub.target

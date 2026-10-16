@@ -1,0 +1,25 @@
+[Unit]
+Description=Jaga Padi CV inference (rice disease, 127.0.0.1:5001)
+After=rikub-backend.service
+PartOf=rikub.target
+# Skipped cleanly on units without the torch venv instead of crash-looping.
+ConditionPathExists=/home/pi/venv_yolo/bin/python
+
+[Service]
+Type=exec
+WorkingDirectory=/home/pi/rikub-project/cv_service
+# Loading torch + YOLO is the single biggest current spike. Cap it: 2 compute
+# threads, at most 2 cores' worth of CPU, lowest scheduling priority, and a short
+# settle after the backend so the two startups never overlap.
+Environment=OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2
+ExecStartPre=/bin/sleep 10
+ExecStart=/home/pi/venv_yolo/bin/python -m uvicorn app:app --host 127.0.0.1 --port 5001
+CPUQuota=200%
+Nice=10
+IOWeight=50
+TimeoutStartSec=180
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=rikub.target

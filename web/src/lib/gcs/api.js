@@ -1,0 +1,335 @@
+import { droneAddrHeaders } from "@/lib/gcs/drone-settings";
+
+async function jsonOrThrow(response) {
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const err = new Error(data?.error || data?.detail || `request failed (${response.status})`);
+    err.status = response.status;
+    throw err;
+  }
+  return data;
+}
+
+// gRPC FAILED_PRECONDITION surfaces as HTTP 409 (grpc_backend.grpc_to_http_status):
+// the mapping backend uses it for "this would disturb a flying mission / delete the
+// only copy of captured frames" — retry with force once the operator confirms.
+export function isPreconditionError(err) {
+  return err?.status === 409;
+}
+
+export async function fetchDiagnostics() {
+  return jsonOrThrow(
+    await fetch("/api/drone/diagnostics", {
+      cache: "no-store",
+      headers: droneAddrHeaders(),
+    }),
+  );
+}
+
+export async function fetchDroneConfig() {
+  return jsonOrThrow(await fetch("/api/drone/config", { cache: "no-store" }));
+}
+
+// List mapping sessions. A drone-flown survey is in here from takeoff on (with
+// its live `capture` block — docs/mapping.md); `captureOnly` keeps just those.
+export async function fetchJobs({ captureOnly } = {}) {
+  const query = captureOnly ? "?capture_only=true" : "";
+  return jsonOrThrow(await fetch(`/api/jobs${query}`, { cache: "no-store" }));
+}
+
+export async function fetchJob(id) {
+  return jsonOrThrow(await fetch(`/api/jobs/${encodeURIComponent(id)}`, { cache: "no-store" }));
+}
+
+export async function createJobFromFolder(sourceDir, opts = {}) {
+  const name = opts.name ?? sourceDir.split("/").filter(Boolean).pop();
+  return jsonOrThrow(await fetch("/api/jobs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ source_dir: sourceDir, name, area_name: opts.areaName, image_glob: opts.imageGlob, options: opts.options }),
+  }));
+}
+
+// Cancel the ODM stitch. Refused (409) while a capture mission is flying the
+// session unless `force` — cancel the mission itself first (cancelMappingMission).
+export async function cancelJob(id, { force = false } = {}) {
+  return jsonOrThrow(await fetch(`/api/jobs/${encodeURIComponent(id)}/cancel`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(force ? { force: true } : {}),
+  }));
+}
+
+// Delete the whole session folder. Refused (409) without `force` while a mission
+// is flying it, or when it holds captured frames that are the only copy.
+export async function removeJob(id, { force = false } = {}) {
+  const query = force ? "?force=true" : "";
+  return jsonOrThrow(await fetch(`/api/jobs/${encodeURIComponent(id)}${query}`, { method: "DELETE" }));
+}
+
+// Copy a finished session's orthophoto + NDVI into THIS system (field imagery: what the
+// spraying and Maps features read). Fire-and-poll: start it, then fetchJobImport until
+// `state` is done | failed. Running it again refreshes the imagery already imported.
+// The artifact URLs on the job point at the mapping backend's plain-HTTP file server,
+// which an HTTPS page cannot fetch — the server does the download itself.
+export async function startJobImport(id, { fieldName } = {}) {
+  return jsonOrThrow(await fetch(`/api/jobs/${encodeURIComponent(id)}/import`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(fieldName ? { field_name: fieldName } : {}),
+  }));
+}
+
+// { state: "none" | "running" | "done" | "failed", progress, message, error,
+//   imagery, field, files: { rgb_tif, ndvi_tif, zones_kml } }
+export async function fetchJobImport(id) {
+  return jsonOrThrow(await fetch(`/api/jobs/${encodeURIComponent(id)}/import`, { cache: "no-store" }));
+}
+
+async function postCommand(path, body = {}) {
+  return jsonOrThrow(
+    await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...droneAddrHeaders() },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export const armDrone = (options = {}) => postCommand("/api/drone/arm", options);
+export const disarmDrone = (options = {}) => postCommand("/api/drone/disarm", options);
+export const takeoffDrone = (options = {}) => postCommand("/api/drone/takeoff", options);
+export const landDrone = (options = {}) => postCommand("/api/drone/land", options);
+export const setDroneMode = (mode, options = {}) =>
+  postCommand("/api/drone/setmode", { mode, ...options });
+
+export async function fetchDroneStatus() {
+  return jsonOrThrow(
+    await fetch("/api/drone/status", { cache: "no-store", headers: droneAddrHeaders() }),
+  );
+}
+
+export async function gotoPoint(p) {
+  return postCommand("/api/drone/goto", {
+    x: p.x,
+    y: p.y,
+    z: p.z,
+    tolerance: p.tolerance,
+    hold_duration: p.holdDuration,
+    method: p.method,
+    max_speed: p.maxSpeed,
+  });
+}
+
+export async function pushMission(p) {
+  return jsonOrThrow(
+    await fetch("/api/drone/mission", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...droneAddrHeaders() },
+      body: JSON.stringify({
+        waypoints: p.waypoints,
+        geo_waypoints: p.geoWaypoints,
+        altitude: p.altitude,
+        speed: p.speed,
+        hold_time: p.holdTime,
+        acceptance_radius: p.acceptanceRadius,
+      }),
+    }),
+  );
+}
+
+// `cameraPreflight: false` (the launch dialog's "Camera preflight" box, unticked) skips the
+// backend's takeoff camera re-check of a mapping flight; omitted / null keeps its default (on).
+export async function executeMission(p = {}) {
+  return jsonOrThrow(
+    await fetch("/api/drone/mission/execute", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...droneAddrHeaders() },
+      body: JSON.stringify({
+        mode: p.mode,
+        altitude: p.altitude,
+        job_id: p.jobId,
+        session_id: p.jobId,
+        ...(p.cameraPreflight != null && { camera_preflight: p.cameraPreflight }),
+      }),
+    }),
+  );
+}
+
+// --- Mapping capture mission (see docs/mapping.md → "drone capture pipeline") -
+
+// Upload a discrete-capture-point mapping mission (PushCaptureMission): a
+// LOITER_UNLIM mission visiting each { lat, lng } station, holding for a photo.
+// Blocking upload; returns the drone status. Follow with
+// executeMission({ mode: "mapping", jobId }) to fly it. `cameraPreflight: false` skips the
+// backend's camera pre-flight (the plan is accepted even if the camera is unreachable and
+// `camera_check` comes back `{ skipped: true, ok: null }`); omitted / null keeps its default (on).
+export async function pushCaptureMission(p) {
+  return jsonOrThrow(
+    await fetch("/api/drone/mapping-mission", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...droneAddrHeaders() },
+      body: JSON.stringify({
+        capture_points: p.capturePoints,
+        altitude: p.altitude,
+        hold_time: p.holdTime,
+        session_id: p.sessionId,
+        ...(p.cameraPreflight != null && { camera_preflight: p.cameraPreflight }),
+      }),
+    }),
+  );
+}
+
+// Read-only poll of the mapping capture mission. The session itself exists from
+// the moment the mission is pushed (its id is the `session_id` you passed), so the
+// persisted flight state lives in fetchJob(sessionId).capture — this is the live
+// per-leg view (`phase`, `captures_done`, `last_error`).
+export async function fetchMappingMissionStatus() {
+  return jsonOrThrow(
+    await fetch("/api/drone/mapping-mission", {
+      cache: "no-store",
+      headers: droneAddrHeaders(),
+    }),
+  );
+}
+
+// End the current leg early (PauseMappingMission): the aircraft returns to its
+// takeoff point, lands, and the frames taken so far are secured. Poll until the
+// session's capture.state is "paused" (or MappingMissionStatus.phase), then
+// resumeMappingMission() flies the remaining points as a new leg.
+export const pauseMappingMission = () => postCommand("/api/drone/mapping-mission/pause", {});
+
+// Start the next leg of a paused / interrupted / failed session
+// (ResumeMappingMission): uploads a plan for the points not yet captured, reusing
+// the session's altitude / hold_time unless overridden. Follow with
+// executeMission({ mode: "mapping", jobId: sessionId }) to fly it. `cameraPreflight` as in
+// pushCaptureMission.
+export async function resumeMappingMission({ sessionId, altitude, holdTime, cameraPreflight } = {}) {
+  return jsonOrThrow(
+    await fetch("/api/drone/mapping-mission/resume", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...droneAddrHeaders() },
+      body: JSON.stringify({
+        session_id: sessionId,
+        ...(altitude != null && { altitude }),
+        ...(holdTime != null && { hold_time: holdTime }),
+        ...(cameraPreflight != null && { camera_preflight: cameraPreflight }),
+      }),
+    }),
+  );
+}
+
+// Drop the capture mission (CancelMappingMission) and tear the monitor down
+// cleanly. The session, its frames and `capture.captured` survive on disk.
+export const cancelMappingMission = (sessionId) =>
+  postCommand("/api/drone/mapping-mission/cancel", sessionId ? { session_id: sessionId } : {});
+
+// --- Camera interface (see docs/drone_api.md → "Camera interface") ------------
+
+// POST with a deadline: a pre-flight probes every adapter and a trigger may fail over
+// down the whole path list, so these are slow (the BFF itself waits up to 70-75 s) —
+// without a deadline a dropped connection would leave the spinner up for ever.
+async function postCommandWithin(path, body, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await jsonOrThrow(
+      await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...droneAddrHeaders() },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      }),
+    );
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      const timeout = new Error("server tidak menjawab (waktu habis)");
+      timeout.status = 0;
+      throw timeout;
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Which way will the next mapping photo be taken? (CameraPreflight.) Probes every
+// path — each PC Wi-Fi adapter, the ESP32's own Wi-Fi, the PWM wire — and returns
+// { ok, method, via, verified, wire_only, degraded, summary, fallbacks[], warnings[],
+//   error, paths[], camera{card, free_pics, photo_count, …}, cached, armed }.
+// `ok:false` / `wire_only:true` are DATA, not errors. `heal` re-joins dropped adapters;
+// `full` also checks the SD card. While the vehicle is armed nothing is probed and the
+// cached state comes back (`cached:true`). Takes up to ~30 s.
+export const cameraPreflight = ({ expectedShots, full = true, heal = true } = {}) =>
+  postCommandWithin(
+    "/api/drone/camera/preflight",
+    { ...(expectedShots != null && { expected_shots: expectedShots }), full, heal },
+    90_000,
+  );
+
+// Fire the camera shutter once (TriggerCamera) — a REAL photo. `method`: "auto" (what a
+// mission does), "wire" (PWM pulse: the camera should BEEP and its live view FREEZE —
+// the only proof a wire shot gets), "esp_wifi", "wifi:<iface>". Refused (409) while armed.
+export const triggerCamera = ({ method = "auto", fallback } = {}) =>
+  postCommandWithin(
+    "/api/drone/camera/trigger",
+    { method, ...(fallback != null && { fallback }) },
+    90_000,
+  );
+
+// --- Reactive spraying (see docs/drone_api.md → "Spraying pipeline") ---------
+
+// Poll the reactive spray session. Pass the previous response's `next_seq` back
+// as `sinceSeq` to fetch only the new sprayed samples for the realtime overlay.
+export async function fetchSprayStatus({ sinceSeq, maxSamples } = {}) {
+  const params = new URLSearchParams();
+  if (sinceSeq != null) params.set("since_seq", String(sinceSeq));
+  if (maxSamples != null) params.set("max_samples", String(maxSamples));
+  const query = params.toString();
+  return jsonOrThrow(
+    await fetch(`/api/drone/spray/status${query ? `?${query}` : ""}`, {
+      cache: "no-store",
+      headers: droneAddrHeaders(),
+    }),
+  );
+}
+
+// Upload a reactive spray mission (path + spray zones + per-liquid rates), then
+// call executeMission({ mode: "spraying", jobId }) to start actuating.
+export async function pushSprayMission(p) {
+  return jsonOrThrow(
+    await fetch("/api/drone/spray/mission", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...droneAddrHeaders() },
+      body: JSON.stringify({
+        session_id: p.sessionId,
+        geo_waypoints: p.geoWaypoints,
+        zones: p.zones,
+        rates: p.rates,
+        swath_width_m: p.swathWidthM,
+        altitude: p.altitude,
+        speed: p.speed,
+      }),
+    }),
+  );
+}
+
+export const cancelSprayMission = () => postCommand("/api/drone/spray/cancel", {});
+export const setSprayConfig = (patch = {}) => postCommand("/api/drone/spray/config", patch);
+
+// Calibrate the sprayer flowmeters (SetFlowConfig). Pass sensorId (1 = D32,
+// 2 = D4) to recalibrate a single line; omit it to apply to every flowmeter.
+// Returns the flow snapshot (full when an ESP sensor is attached, else just
+// the echoed pulses_per_liter).
+export async function setFlowConfig(pulsesPerLiter, sensorId) {
+  return jsonOrThrow(
+    await fetch("/api/drone/flow-config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...droneAddrHeaders() },
+      body: JSON.stringify({
+        pulses_per_liter: pulsesPerLiter,
+        ...(sensorId !== undefined && { sensor_id: sensorId }),
+      }),
+    }),
+  );
+}
